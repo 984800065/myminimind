@@ -32,6 +32,18 @@ def apply_rotary_pos_emb_interleave(q: torch.Tensor, k: torch.Tensor, cos: torch
     return q_embed, k_embed
 
 
+class MyCausalLMOutputWithPast(CausalLMOutputWithPast):
+    aux_loss: torch.Tensor | None = None
+
+    def __init__(
+        self,
+        aux_loss: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.aux_loss = aux_loss
+
+
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -72,7 +84,10 @@ class RotaryEmbedding(nn.Module):
         seq_len: int | None = None,
     ) -> tuple[torch.Tensor, float]:
         base = config.rope_params["rope_theta"]
-        dim = config.hidden_size
+
+        # adjust for multihead attention
+        assert config.hidden_size % config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
+        dim = config.hidden_size // config.num_attention_heads
 
         attention_factor = 1.0
 
@@ -124,8 +139,6 @@ class GroupQueryAttention(nn.Module):
         assert self.num_heads % self.group_num == 0, "num_heads must be divisible by group_num"
         self.num_key_value_heads = self.num_heads // self.group_num
 
-        self.norm = RMSNorm(self.hidden_size, config.rms_norm_eps)
-
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim)
@@ -175,10 +188,11 @@ class GroupQueryAttention(nn.Module):
         # (batch_size, num_key_value_heads, seq_len, head_dim)
         v = v.reshape(batch_size, seq_len, num_key_value_heads, head_dim).transpose(1, 2)
 
+        # cos.shape == sin.shape == (batch_size, seq_len, head_dim)
         cos, sin = position_embeddings
         # q.shape == (batch_size, num_heads, seq_len, head_dim)
         # k.shape == (batch_size, num_key_value_heads, seq_len, head_dim)
-        q, k = apply_rotary_pos_emb_interleave(q, k, cos=cos, sin=sin, position_ids=None, unsqueeze_dim=2)
+        q, k = apply_rotary_pos_emb_interleave(q, k, cos=cos, sin=sin, position_ids=None, unsqueeze_dim=1)
 
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
@@ -190,21 +204,19 @@ class GroupQueryAttention(nn.Module):
         # (batch_size, num_heads, seq_len + past_seq_len, head_dim)
         v = self._repeat_kv(v, repeat_times)
 
-        if self.is_flash_attention and seq_len > 1 and past_key_values is None and (attention_mask is None or torch.all(attention_mask == 1)):
+        if self.is_flash_attention and seq_len > 1 and past_key_values is None:
             # (batch_size, num_heads, seq_len, head_dim)
-            output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.config.dropout if self.training else 0.0, is_causal=True)
+            output = F.scaled_dot_product_attention(q, k, v, dropout_p=self.config.dropout if self.training else 0.0, attn_mask=attention_mask)
         else:
+            raise AssertionError("手动禁用了手写attn")
             # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
             attention_scores = torch.einsum("bhid,bhjd->bhij", q, k) / math.sqrt(head_dim)
             # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
             attention_scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=attention_scores.device), diagonal=1)
 
-            # attention_mask.shape == (batch_size, seq_len + past_seq_len), full with 1 and 0. 1 means valid, 0 means masked.
             if attention_mask is not None:
-                # (batch_size, 1, 1, seq_len + past_seq_len)
-                extended_attention_mask = (1.0 - attention_mask[:, None, None, :]) * -1e9
-                # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
-                attention_scores = attention_scores + extended_attention_mask
+                # attention_mask.shape == (batch_size, 1, seq_len, seq_len + past_seq_len), full with 1 and 0. 1 means valid, 0 means masked.
+                attention_scores = attention_scores + attention_mask
 
             # (batch_size, num_heads, seq_len, seq_len + past_seq_len)
             attention_weights = F.softmax(attention_scores, dim=-1).type_as(q)
@@ -238,12 +250,11 @@ class GLU_FFN(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, config: MyMiniMindConfig):
         super().__init__()
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.glu_ffn = GLU_FFN(config)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # multi return to compatible with MoEFeedForward
-        return self.glu_ffn(self.norm(x)), x.new_tensor(0.0)
+        return self.glu_ffn(x), x.new_tensor(0.0)
 
 
 class MoEGate(nn.Module):
@@ -334,12 +345,10 @@ class MoEFeedForward(nn.Module):
         self.gate = MoEGate(config)
         self.shared_experts = nn.ModuleList([GLU_FFN(config) for _ in range(config.num_shared_experts)])
         self.capacity_factor = config.capacity_factor
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, seq_len, hidden_size = x.shape
         top_k = self.config.num_experts_per_token
-        x = self.norm(x)
 
         # topk_idx.shape == (batch_size, seq_len, top_k)
         # topk_weights.shape == (batch_size, seq_len, top_k)
@@ -518,7 +527,7 @@ class MyMiniMindModel(nn.Module):
         hidden_states: torch.Tensor = self.dropout(input_embeds)
         # [cos, sin]
         position_embeddings: tuple[torch.Tensor, torch.Tensor] = self.rotary_emb(hidden_states, position_ids=position_ids)
-        aux_loss = torch.Tensor(0.0, device=hidden_states.device)
+        aux_loss = torch.tensor(0.0, device=hidden_states.device)
 
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states, layer_aux_loss = decoder_layer(
@@ -544,7 +553,16 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.model.embed_tokens.weight = self.lm_head.weight
 
-    def forward(self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, labels: torch.Tensor | None = None, past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, use_cache: bool = False, logits_to_keep: int | torch.Tensor = 0, **kwargs) -> CausalLMOutputWithPast:
+    def forward(
+        self, 
+        input_ids: torch.Tensor | None = None, 
+        attention_mask: torch.Tensor | None = None, 
+        labels: torch.Tensor | None = None, 
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, 
+        use_cache: bool = False, 
+        logits_to_keep: int | torch.Tensor = 0, 
+        **kwargs
+    ) -> MyCausalLMOutputWithPast:
         hidden_states, aux_loss = self.model(input_ids=input_ids, attention_mask=attention_mask, past_key_values=past_key_values, use_cache=use_cache, **kwargs)
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
@@ -560,7 +578,7 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
 
             assert not math.isnan(loss), f"loss is nan, shift_logits: {shift_logits}, shift_labels: {shift_labels}"
 
-        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        output = MyCausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
 
         return output

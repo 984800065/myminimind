@@ -49,7 +49,7 @@ class PretrainConfig(BaseSettings):
 
     # ----- 训练超参 -----
     epochs: int = Field(1, ge=1, description="训练轮数")
-    batch_size: int = Field(32, gt=0, description="batch size")
+    batch_size: int = Field(8, gt=0, description="batch size")
     learning_rate: float = Field(5e-4, gt=0.0, description="初始学习率")
     accumulation_steps: int = Field(8, ge=1, description="梯度累积步数")
     grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
@@ -63,13 +63,13 @@ class PretrainConfig(BaseSettings):
     # ----- 数据 -----
     data_path: str = Field("./dataset/pretrain_hq.jsonl", description="预训练数据路径（jsonl）")
     num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
-    max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
+    max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
 
     # ----- 分词器 -----
     tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(640, gt=0, description="隐藏层维度")
+    hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
     use_moe: bool = Field(True, description="是否使用 MoE 架构")
 
@@ -81,6 +81,9 @@ class PretrainConfig(BaseSettings):
     use_swanlab: bool = Field(True, description="是否使用 swanlab 记录")
     swanlab_project: str = Field("MiniMind-Pretrain", description="swanlab 项目名")
     use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
+
+    # ------ debug -----
+    debug: bool = Field(False, description="是否开启 debug 模式（小数据、频繁保存、详细日志）")
 
     def to_lm_config_kwargs(self) -> dict:
         """
@@ -118,13 +121,13 @@ class InferConfig(BaseSettings):
     lora_weight: str = Field("None", description="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(640, gt=0, description="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
+    hidden_size: int = Field(1024, gt=0, description="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量（Small/MoE=8, Base=16）")
     use_moe: bool = Field(True, description="是否使用MoE架构")
 
     # ----- 推理与生成 -----
     inference_rope_scaling: bool = Field(False, description="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
-    max_new_tokens: int = Field(8192, gt=0, description="最大生成长度（注意：并非模型实际长文本能力）")
+    max_new_tokens: int = Field(1024, gt=0, description="最大生成长度（注意：并非模型实际长文本能力）")
     temperature: float = Field(0.85, ge=0.0, le=2.0, description="生成温度，控制随机性（0-1，越大越随机）")
     top_p: float = Field(0.85, ge=0.0, le=1.0, description="nucleus采样阈值（0-1）")
 
@@ -168,8 +171,8 @@ class SFTConfig(BaseSettings):
     log_interval: int = Field(100, gt=0, description="每 N step 打一次日志")
 
     # ----- 训练超参 -----
-    epochs: int = Field(2, ge=1, description="训练轮数")
-    batch_size: int = Field(16, gt=0, description="batch size")
+    epochs: int = Field(1, ge=1, description="训练轮数")
+    batch_size: int = Field(8, gt=0, description="batch size")
     learning_rate: float = Field(1e-6, gt=0.0, description="初始学习率")
     accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
     grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
@@ -179,15 +182,15 @@ class SFTConfig(BaseSettings):
     dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
 
     # ----- 数据 -----
-    data_path: str = Field("./dataset/sft_mini_512.jsonl", description="SFT 训练数据路径（jsonl）")
+    data_path: str = Field("./dataset/sft_512.jsonl", description="SFT 训练数据路径（jsonl）")
     num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
-    max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
+    max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
 
     # ----- 分词器 -----
     tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(640, gt=0, description="隐藏层维度")
+    hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
     use_moe: bool = Field(True, description="是否使用 MoE 架构")
 

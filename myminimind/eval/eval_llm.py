@@ -6,15 +6,15 @@ from transformers import AutoTokenizer, BatchEncoding, TextStreamer
 
 from myminimind.config import get_infer_config
 from myminimind.config.schema import InferConfig
-from myminimind.model.minimind_config import MiniMindConfig
-from myminimind.model.minimind_model import MiniMindForCausalLM
+from myminimind.model.configuration_myminimind import MyMiniMindConfig
+from myminimind.model.modular_myminimind import MyMiniMindForCausalLM
 from myminimind.utils.train_utils import get_model_params, setup_seed
 
 
-def init_model(infer_cfg: InferConfig) -> tuple[MiniMindForCausalLM, Any]:
+def init_model(infer_cfg: InferConfig) -> tuple[MyMiniMindForCausalLM, Any]:
     tokenizer = AutoTokenizer.from_pretrained(infer_cfg.tokenizer_path)
-    model_config = MiniMindConfig(**infer_cfg.to_lm_config_kwargs())
-    model = MiniMindForCausalLM(model_config)
+    model_config = MyMiniMindConfig(**infer_cfg.to_lm_config_kwargs())
+    model = MyMiniMindForCausalLM(model_config)
     moe_suffix = "_moe" if infer_cfg.use_moe else ""
     ckpt = f"./{infer_cfg.save_dir}/{infer_cfg.weight}_{infer_cfg.hidden_size}{moe_suffix}.pth"
     model.load_state_dict(torch.load(ckpt, map_location=infer_cfg.device), strict=True)

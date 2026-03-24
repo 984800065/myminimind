@@ -16,8 +16,8 @@ from tqdm.auto import tqdm
 
 from myminimind.config import PretrainConfig, get_pretrain_config
 from myminimind.data.lm_dataset import PretrainDataset
-from myminimind.model.minimind_config import MiniMindConfig
-from myminimind.model.minimind_model import CausalLMOutputWithPast, MiniMindForCausalLM
+from myminimind.model.configuration_myminimind import MyMiniMindConfig
+from myminimind.model.modular_myminimind import MyCausalLMOutputWithPast, MyMiniMindForCausalLM
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
     SkipBatchSampler,
@@ -33,12 +33,12 @@ def train_epoch(
     cfg: PretrainConfig,
     epoch: int,
     loader: DataLoader,
-    model: MiniMindForCausalLM,
+    model: MyMiniMindForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    scaler: torch.amp.GradScaler,
-    autocast_ctx: nullcontext | torch.amp.autocast,
-    lm_config: MiniMindConfig,
+    scaler: torch.GradScaler,
+    autocast_ctx: nullcontext | torch.autocast,
+    lm_config: MyMiniMindConfig,
     last_end_step: int = 0,
     swanlab_: swanlab.Run | None = None,
 ) -> None:
@@ -58,8 +58,14 @@ def train_epoch(
         labels = labels.to(cfg.device)
 
         with autocast_ctx:
-            res: CausalLMOutputWithPast = model(input_ids=input_ids, labels=labels)
-            loss: torch.Tensor = res.loss + res.aux_loss
+
+            res: MyCausalLMOutputWithPast = model(input_ids=input_ids, labels=labels)
+            assert res.loss is not None, "模型前向传播未返回loss"
+            if res.aux_loss is None:
+                loss = res.loss
+            else:
+                loss: torch.Tensor = res.loss + res.aux_loss
+                
             cur_loss = loss.item()
             cur_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
 
@@ -94,7 +100,8 @@ def train_epoch(
         if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
             moe_suffix = "_moe" if lm_config.use_moe else ""
-            ckp = f"{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            debug_suffix = "_debug" if cfg.debug else ""
+            ckp = f"{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}{debug_suffix}.pth"
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, "_orig_mod", raw_model)
             state_dict = raw_model.state_dict()
@@ -118,12 +125,12 @@ def train_epoch(
 
 def train(
     cfg: PretrainConfig,
-    model: MiniMindForCausalLM,
+    model: MyMiniMindForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    scaler: torch.amp.GradScaler,
+    scaler: torch.GradScaler,
     autocast_ctx,
-    lm_config: MiniMindConfig,
+    lm_config: MyMiniMindConfig,
     train_sampler: DistributedSampler | None,
     train_dataset: PretrainDataset,
     last_end_epoch: int,
@@ -164,13 +171,13 @@ def main():
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    lm_config = MyMiniMindConfig(**cfg.to_lm_config_kwargs())
     ckp_data = lm_checkpoint(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir) if cfg.from_resume else None
 
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in cfg.device else "cpu"
     dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.autocast(device_type=device_type, dtype=dtype)
 
     # ========== 4. 配swanlab ==========
     swanlab_ = None
@@ -196,7 +203,7 @@ def main():
 
     train_dataset = PretrainDataset(cfg.data_path, tokenizer, max_length=cfg.max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
-    scaler = torch.amp.GradScaler(enabled=(cfg.dtype == "float16"))
+    scaler = torch.GradScaler(enabled=(cfg.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     cur_rank_total_samples = len(train_sampler) if train_sampler is not None else len(train_dataset)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs * ((cur_rank_total_samples + cfg.batch_size - 1) // cfg.batch_size), eta_min=0.1 * cfg.learning_rate)
@@ -212,8 +219,7 @@ def main():
 
     # ========== 7. DDP包模型 ==========
     if dist.is_initialized():
-        model._ddp_params_and_buffers_to_ignore = {"cos_phi", "sin_phi"}
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # ========== 8. 开始训练 ==========
     train(

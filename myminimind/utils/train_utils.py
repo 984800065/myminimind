@@ -8,8 +8,8 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 
-from myminimind.model.minimind_config import MiniMindConfig
-from myminimind.model.minimind_model import MiniMindForCausalLM
+from myminimind.model.configuration_myminimind import MyMiniMindConfig
+from myminimind.model.modular_myminimind import MyMiniMindForCausalLM
 from myminimind.utils.logger import logger
 
 
@@ -38,7 +38,7 @@ def setup_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def lm_checkpoint(lm_config: MiniMindConfig, weight: str = "full_sft", model=None, optimizer=None, epoch=0, step=0, swanlab_=None, save_dir="./checkpoints", **kwargs) -> dict | None:
+def lm_checkpoint(lm_config: MyMiniMindConfig, weight: str = "full_sft", model=None, optimizer=None, epoch=0, step=0, swanlab_=None, save_dir="./checkpoints", **kwargs) -> dict | None:
     os.makedirs(save_dir, exist_ok=True)
     moe_path = "_moe" if lm_config.use_moe else ""
     ckp_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth"
@@ -91,7 +91,7 @@ def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def get_model_params(model: MiniMindForCausalLM, config: MiniMindConfig):
+def get_model_params(model: MyMiniMindForCausalLM, config: MyMiniMindConfig):
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, "num_routed_experts", getattr(config, "num_experts", 0))
     n_active = getattr(config, "num_experts_per_token", 0)
@@ -106,9 +106,9 @@ def get_model_params(model: MiniMindForCausalLM, config: MiniMindConfig):
         logger.info(f"Model Params: {total:.2f}M")
 
 
-def init_model(lm_config: MiniMindConfig, from_weight: str, tokenizer_path: str, save_dir: str, device: str) -> tuple[MiniMindForCausalLM, AutoTokenizer]:
+def init_model(lm_config: MyMiniMindConfig, from_weight: str, tokenizer_path: str, save_dir: str, device: str) -> tuple[MyMiniMindForCausalLM, AutoTokenizer]:
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindForCausalLM(lm_config)
+    model = MyMiniMindForCausalLM(lm_config)
 
     if from_weight != "none":
         moe_suffix = "_moe" if lm_config.use_moe else ""

@@ -92,6 +92,9 @@ def _build_pretrain_parser() -> argparse.ArgumentParser:
     p.add_argument("--swanlab-project", type=str, default=None, dest="swanlab_project")
     p.add_argument("--use-compile", nargs="?", const="1", default=None, dest="use_compile", help="0/1 或省略即 1")
 
+    # 调试相关（不覆盖配置文件，专门用来临时开启 debug 模式）
+    p.add_argument("--debug", nargs="?", const="1", default=None, dest="debug", help="启用 debug 模式（小数据集+多日志）")
+
     return p
 
 
