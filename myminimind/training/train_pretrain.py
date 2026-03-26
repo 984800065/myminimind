@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from myminimind.config import PretrainConfig, get_pretrain_config
-from myminimind.data.lm_dataset import PretrainDataset
+from myminimind.data import PretrainDataset
 from myminimind.model.configuration_myminimind import MyMiniMindConfig
 from myminimind.model.modular_myminimind import MyCausalLMOutputWithPast, MyMiniMindForCausalLM
 from myminimind.training.deepspeed_utils import (

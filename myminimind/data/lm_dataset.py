@@ -1,3 +1,11 @@
+"""
+本项目内部使用的数据集实现。
+
+注意：
+  - 当前项目的训练代码依赖这里的 Dataset 实现。
+  - 顶层 `dataset/` 目录中的同名文件如果来自其它项目挂载，不作为当前项目代码入口。
+"""
+
 import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
@@ -176,3 +184,6 @@ class RLAIFDataset(Dataset):
         prompt, answer = self.create_chat_prompt(sample["conversations"])
 
         return {"prompt": prompt, "answer": answer}
+
+
+__all__ = ["DPODataset", "PretrainDataset", "RLAIFDataset", "SFTDataset"]

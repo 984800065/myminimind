@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from myminimind.config import SFTConfig, get_sft_config
-from myminimind.data.lm_dataset import SFTDataset
+from myminimind.data import SFTDataset
 from myminimind.model.configuration_myminimind import MyMiniMindConfig
 from myminimind.model.modular_myminimind import MyCausalLMOutputWithPast, MyMiniMindForCausalLM
 from myminimind.utils.logger import logger

@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
 from myminimind.config import GRPOConfig, get_grpo_config
-from myminimind.data.lm_dataset import RLAIFDataset
+from myminimind.data import RLAIFDataset
 from myminimind.model.configuration_myminimind import MyMiniMindConfig as MiniMindConfig
 from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM as MiniMindForCausalLM
 from myminimind.utils.logger import logger

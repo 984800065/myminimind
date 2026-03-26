@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
 from myminimind.config import DistillationConfig, get_distillation_config
-from myminimind.data.lm_dataset import SFTDataset
+from myminimind.data import SFTDataset
 from myminimind.model.configuration_myminimind import MyMiniMindConfig as MiniMindConfig
 from myminimind.model.modeling_myminimind import (
     MyCausalLMOutputWithPast as CausalLMOutputWithPast,
