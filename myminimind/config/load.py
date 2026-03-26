@@ -44,6 +44,16 @@ def _bool_opt(s: str | None) -> bool | None:
     return str(s).lower() in ("1", "true", "yes")
 
 
+def _add_attention_parser_args(parser: argparse.ArgumentParser) -> None:
+    """给命令行解析器补充 attention_type 和 MLA 相关参数。"""
+    parser.add_argument("--attention-type", type=str, default=None, dest="attention_type", choices=["gqa", "mla"])
+    parser.add_argument("--mla-q-lora-rank", type=int, default=None, dest="mla_q_lora_rank")
+    parser.add_argument("--mla-kv-lora-rank", type=int, default=None, dest="mla_kv_lora_rank")
+    parser.add_argument("--mla-qk-nope-head-dim", type=int, default=None, dest="mla_qk_nope_head_dim")
+    parser.add_argument("--mla-qk-rope-head-dim", type=int, default=None, dest="mla_qk_rope_head_dim")
+    parser.add_argument("--mla-v-head-dim", type=int, default=None, dest="mla_v_head_dim")
+
+
 def _build_pretrain_parser() -> argparse.ArgumentParser:
     """
     构建命令行解析器。所有参数 default=None，表示「没传就不覆盖」：
@@ -82,6 +92,7 @@ def _build_pretrain_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
     # nargs="?" + const="1"：只写 --use-moe 时当作 "1"（True），写 --use-moe 0 时为 "0"（False）
     p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+    _add_attention_parser_args(p)
 
     # 恢复与续训
     p.add_argument("--from-weight", type=str, default=None, dest="from_weight")
@@ -91,6 +102,13 @@ def _build_pretrain_parser() -> argparse.ArgumentParser:
     p.add_argument("--use-swanlab", nargs="?", const="1", default=None, dest="use_swanlab", help="启用 swanlab")
     p.add_argument("--swanlab-project", type=str, default=None, dest="swanlab_project")
     p.add_argument("--use-compile", nargs="?", const="1", default=None, dest="use_compile", help="0/1 或省略即 1")
+
+    # DeepSpeed
+    p.add_argument("--use-deepspeed", nargs="?", const="1", default=None, dest="use_deepspeed", help="启用 DeepSpeed")
+    p.add_argument("--deepspeed-config", type=str, default=None, dest="deepspeed_config", help="DeepSpeed 配置文件路径（json/yaml）")
+    p.add_argument("--deepspeed-zero-stage", type=int, default=None, dest="deepspeed_zero_stage", choices=[0, 1, 2])
+    p.add_argument("--deepspeed-offload-optimizer", nargs="?", const="1", default=None, dest="deepspeed_offload_optimizer", help="启用 DeepSpeed CPU optimizer offload")
+    p.add_argument("--deepspeed-tensor-parallel-size", type=int, default=None, dest="deepspeed_tensor_parallel_size")
 
     # 调试相关（不覆盖配置文件，专门用来临时开启 debug 模式）
     p.add_argument("--debug", nargs="?", const="1", default=None, dest="debug", help="启用 debug 模式（小数据集+多日志）")
@@ -108,17 +126,46 @@ def _build_infer_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-dir", type=str, default=None, dest="save_dir")
     p.add_argument("--weight", type=str, default=None)
     p.add_argument("--lora-weight", type=str, default=None, dest="lora_weight")
+    p.add_argument("--model-config-path", type=str, default=None, dest="model_config_path")
+    p.add_argument("--hf-model-dir", type=str, default=None, dest="hf_model_dir")
 
     # 模型结构
+    p.add_argument("--hidden-act", type=str, default=None, dest="hidden_act")
     p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
+    p.add_argument("--intermediate-size", type=int, default=None, dest="intermediate_size")
+    p.add_argument("--max-seq-len", type=int, default=None, dest="max_seq_len")
+    p.add_argument("--num-attention-heads", type=int, default=None, dest="num_attention_heads")
     p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
+    p.add_argument("--group-num", type=int, default=None, dest="group_num")
+    _add_attention_parser_args(p)
+    p.add_argument("--vocab-size", type=int, default=None, dest="vocab_size")
+    p.add_argument("--rms-norm-eps", type=float, default=None, dest="rms_norm_eps")
+    p.add_argument("--rope-base", type=int, default=None, dest="rope_base")
     p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+    p.add_argument("--flash-attention", nargs="?", const="1", default=None, dest="flash_attention", help="0/1 或省略即 1")
+    p.add_argument("--num-experts-per-token", type=int, default=None, dest="num_experts_per_token")
+    p.add_argument("--num-routed-experts", type=int, default=None, dest="num_routed_experts")
+    p.add_argument("--num-shared-experts", type=int, default=None, dest="num_shared_experts")
+    p.add_argument("--scoring-function", type=str, default=None, dest="scoring_function")
+    p.add_argument("--aux-loss-alpha", type=float, default=None, dest="aux_loss_alpha")
+    p.add_argument("--seq-aux", nargs="?", const="1", default=None, dest="seq_aux", help="0/1 或省略即 1")
+    p.add_argument("--norm-topk-prob", nargs="?", const="1", default=None, dest="norm_topk_prob", help="0/1 或省略即 1")
+    p.add_argument("--capacity-factor", type=float, default=None, dest="capacity_factor")
 
     # 推理与生成
     p.add_argument("--inference-rope-scaling", nargs="?", const="1", default=None, dest="inference_rope_scaling", help="启用RoPE外推")
     p.add_argument("--max-new-tokens", type=int, default=None, dest="max_new_tokens")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-p", type=float, default=None, dest="top_p")
+    p.add_argument("--vllm-runner", type=str, default=None, dest="vllm_runner")
+    p.add_argument("--vllm-model-impl", type=str, default=None, dest="vllm_model_impl")
+    p.add_argument("--vllm-dtype", type=str, default=None, dest="vllm_dtype")
+    p.add_argument("--vllm-tensor-parallel-size", type=int, default=None, dest="vllm_tensor_parallel_size")
+    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=None, dest="vllm_gpu_memory_utilization")
+    p.add_argument("--vllm-max-model-len", type=int, default=None, dest="vllm_max_model_len")
+    p.add_argument("--vllm-max-num-seqs", type=int, default=None, dest="vllm_max_num_seqs")
+    p.add_argument("--vllm-enforce-eager", nargs="?", const="1", default=None, dest="vllm_enforce_eager", help="0/1 或省略即 1")
+    p.add_argument("--vllm-trust-remote-code", nargs="?", const="1", default=None, dest="vllm_trust_remote_code", help="0/1 或省略即 1")
 
     # 对话与展示
     p.add_argument("--historys", type=int, default=None)
@@ -164,6 +211,7 @@ def _build_sft_parser() -> argparse.ArgumentParser:
     p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
     p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
     p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+    _add_attention_parser_args(p)
 
     # 恢复与续训
     p.add_argument("--from-weight", type=str, default=None, dest="from_weight")
@@ -211,6 +259,7 @@ def _build_dpo_parser() -> argparse.ArgumentParser:
     p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
     p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
     p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+    _add_attention_parser_args(p)
 
     # 恢复与续训
     p.add_argument("--from-weight", type=str, default=None, dest="from_weight")
@@ -263,6 +312,7 @@ def _build_grpo_parser() -> argparse.ArgumentParser:
     p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
     p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
     p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+    _add_attention_parser_args(p)
 
     # 恢复与续训
     p.add_argument("--from-resume", nargs="?", const="1", default=None, dest="from_resume", help="0/1 或省略即 1")
@@ -316,6 +366,7 @@ def _build_distillation_parser() -> argparse.ArgumentParser:
     p.add_argument("--hidden-size", type=int, default=None, dest="hidden_size")
     p.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
     p.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
+    _add_attention_parser_args(p)
 
     # 恢复与续训
     p.add_argument("--from-weight", type=str, default=None, dest="from_weight")
@@ -361,7 +412,7 @@ def get_pretrain_config(args: list[str] | None = None) -> PretrainConfig:
         if val is None:
             continue
         # 命令行里布尔类参数可能是字符串 "0"/"1"，转成 bool
-        if key in ("use_moe", "from_resume", "use_swanlab", "use_compile"):
+        if key in ("use_moe", "from_resume", "use_swanlab", "use_compile", "use_deepspeed", "deepspeed_offload_optimizer"):
             val = _bool_opt(val)
         config_dict[key] = val
 
@@ -385,7 +436,15 @@ def get_infer_config(args: list[str] | None = None) -> InferConfig:
             if k in config_dict and v is not None:
                 config_dict[k] = v
 
-    infer_bool_keys = ("use_moe", "inference_rope_scaling")
+    infer_bool_keys = (
+        "use_moe",
+        "flash_attention",
+        "seq_aux",
+        "norm_topk_prob",
+        "inference_rope_scaling",
+        "vllm_enforce_eager",
+        "vllm_trust_remote_code",
+    )
     for key in list(config_dict.keys()):
         val = getattr(parsed, key, None)
         if val is None:

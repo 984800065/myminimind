@@ -21,6 +21,7 @@ from myminimind.model.modular_myminimind import MyCausalLMOutputWithPast, MyMini
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
     SkipBatchSampler,
+    get_model_weight_path,
     init_distributed,
     init_model,
     is_main_process,
@@ -96,8 +97,13 @@ def train_epoch(
 
         if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
-            moe_suffix = "_moe" if lm_config.use_moe else ""
-            ckp = f"{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            ckp = get_model_weight_path(
+                save_dir=cfg.save_dir,
+                weight=cfg.save_weight,
+                hidden_size=lm_config.hidden_size,
+                use_moe=lm_config.use_moe,
+                attention_type=lm_config.attention_type,
+            )
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, "_orig_mod", raw_model)
             state_dict = raw_model.state_dict()

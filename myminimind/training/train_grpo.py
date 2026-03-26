@@ -18,11 +18,12 @@ from transformers import AutoModel, AutoTokenizer
 
 from myminimind.config import GRPOConfig, get_grpo_config
 from myminimind.data.lm_dataset import RLAIFDataset
-from myminimind.model.minimind_config import MiniMindConfig
-from myminimind.model.minimind_model import MiniMindForCausalLM
+from myminimind.model.configuration_myminimind import MyMiniMindConfig as MiniMindConfig
+from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM as MiniMindForCausalLM
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
     SkipBatchSampler,
+    get_model_weight_path,
     init_distributed,
     init_model,
     is_main_process,
@@ -264,8 +265,13 @@ def grpo_train_epoch(
 
         if (step % cfg.save_interval == 0 or step == one_based_base_iters - 1) and is_main_process():
             model.eval()
-            moe_suffix = "_moe" if lm_config.use_moe else ""
-            ckp = f"{cfg.save_dir}/{cfg.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+            ckp = get_model_weight_path(
+                save_dir=cfg.save_dir,
+                weight=cfg.save_weight,
+                hidden_size=lm_config.hidden_size,
+                use_moe=lm_config.use_moe,
+                attention_type=getattr(lm_config, "attention_type", "gqa"),
+            )
             raw_model = model.module if isinstance(model, DistributedDataParallel) else model
             raw_model = getattr(raw_model, "_orig_mod", raw_model)
             state_dict = raw_model.state_dict()

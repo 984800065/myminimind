@@ -13,6 +13,7 @@ build/
 # 虚拟环境
 venv/
 .venv/
+.venv*/
 env/
 
 # IDE
@@ -20,6 +21,7 @@ env/
 .vscode/
 *.swp
 *.swo
+.ruff*/
 
 # 系统
 .DS_Store
@@ -28,6 +30,7 @@ Thumbs.db
 # 项目：日志、输出、权重、数据
 logs/
 output/
+out/
 checkpoints/
 *.pth
 *.pt
@@ -37,3 +40,4 @@ datasets
 datasets/
 dataset
 dataset/
+artifacts/

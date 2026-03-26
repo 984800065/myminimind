@@ -13,14 +13,34 @@ from myminimind.model.modular_myminimind import MyMiniMindForCausalLM
 from myminimind.utils.logger import logger
 
 
-def init_distributed() -> int:
+def get_attention_suffix(attention_type: str) -> str:
+    attention_type = attention_type.lower()
+    return "" if attention_type == "gqa" else f"_{attention_type}"
+
+
+def get_model_variant_suffix(hidden_size: int, use_moe: bool, attention_type: str) -> str:
+    moe_suffix = "_moe" if use_moe else ""
+    return f"{hidden_size}{moe_suffix}{get_attention_suffix(attention_type)}"
+
+
+def get_model_weight_path(save_dir: str, weight: str, hidden_size: int, use_moe: bool, attention_type: str) -> str:
+    variant_suffix = get_model_variant_suffix(hidden_size, use_moe, attention_type)
+    return f"{save_dir}/{weight}_{variant_suffix}.pth"
+
+
+def init_distributed(use_deepspeed: bool = False) -> int:
     if int(os.environ.get("RANK", -1)) == -1:
         return 0
 
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-    )
+    if use_deepspeed:
+        import deepspeed
+
+        deepspeed.init_distributed(dist_backend="nccl")
+    else:
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+        )
 
     local_rank = int(os.environ.get("LOCAL_RANK"))
     torch.cuda.set_device(local_rank)
@@ -40,9 +60,13 @@ def setup_seed(seed: int):
 
 def lm_checkpoint(lm_config: MyMiniMindConfig, weight: str = "full_sft", model=None, optimizer=None, epoch=0, step=0, swanlab_=None, save_dir="./checkpoints", **kwargs) -> dict | None:
     os.makedirs(save_dir, exist_ok=True)
-    moe_path = "_moe" if lm_config.use_moe else ""
-    ckp_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth"
-    resume_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth"
+    variant_suffix = get_model_variant_suffix(
+        hidden_size=lm_config.hidden_size,
+        use_moe=lm_config.use_moe,
+        attention_type=getattr(lm_config, "attention_type", "gqa"),
+    )
+    ckp_path = f"{save_dir}/{weight}_{variant_suffix}.pth"
+    resume_path = f"{save_dir}/{weight}_{variant_suffix}_resume.pth"
 
     if model is not None:
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
@@ -96,14 +120,15 @@ def get_model_params(model: MyMiniMindForCausalLM, config: MyMiniMindConfig):
     n_routed = getattr(config, "num_routed_experts", getattr(config, "num_experts", 0))
     n_active = getattr(config, "num_experts_per_token", 0)
     n_shared = getattr(config, "num_shared_experts", 0)
+    attention_type = getattr(config, "attention_type", "gqa")
     expert = sum(p.numel() for n, p in model.named_parameters() if "mlp.experts.0." in n) / 1e6
     shared_expert = sum(p.numel() for n, p in model.named_parameters() if "mlp.shared_experts.0." in n) / 1e6
     base = total - (expert * n_routed) - (shared_expert * n_shared)
     active = base + (expert * n_active) + (shared_expert * n_shared)
     if active < total:
-        logger.info(f"Model Params: {total:.2f}M-A{active:.2f}M")
+        logger.info(f"Model Params: {total:.2f}M-A{active:.2f}M ({attention_type})")
     else:
-        logger.info(f"Model Params: {total:.2f}M")
+        logger.info(f"Model Params: {total:.2f}M ({attention_type})")
 
 
 def init_model(lm_config: MyMiniMindConfig, from_weight: str, tokenizer_path: str, save_dir: str, device: str) -> tuple[MyMiniMindForCausalLM, AutoTokenizer]:
@@ -111,8 +136,13 @@ def init_model(lm_config: MyMiniMindConfig, from_weight: str, tokenizer_path: st
     model = MyMiniMindForCausalLM(lm_config)
 
     if from_weight != "none":
-        moe_suffix = "_moe" if lm_config.use_moe else ""
-        weight_path = f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+        weight_path = get_model_weight_path(
+            save_dir=save_dir,
+            weight=from_weight,
+            hidden_size=lm_config.hidden_size,
+            use_moe=lm_config.use_moe,
+            attention_type=getattr(lm_config, "attention_type", "gqa"),
+        )
         weights: dict = torch.load(weight_path, map_location=device)
 
         ignore_keys = {
