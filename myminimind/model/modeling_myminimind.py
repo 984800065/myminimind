@@ -58,6 +58,18 @@ def apply_rotary_pos_emb_interleave(q: torch.Tensor, k: torch.Tensor, cos: torch
     return q_embed, k_embed
 
 
+def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: int | None = None) -> torch.Tensor:
+    # x.shape == (batch_size, seq_len, head_dim)
+    # cos.shape == (batch_size, seq_len, head_dim)
+    # sin.shape == (batch_size, seq_len, head_dim)
+
+    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+        # x.shape == (batch_size, seq_len, head_dim)
+        return torch.cat([-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1)
+
+    return x * cos + _rotate_half(x) * sin
+
+
 def myminimind_eager_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -350,12 +362,17 @@ class MultiHeadLatentAttention(nn.Module):
         self.is_flash_attention = False
 
     def _project_query(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # hidden_states.shape == (batch_size, seq_len, hidden_size)
         if self.q_proj is not None:
+            # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
             return self.q_proj(hidden_states)
 
         assert self.q_a_proj is not None
         assert self.q_b_proj is not None
         assert self.q_norm is not None
+        # q_a.shape == (batch_size, seq_len, q_lora_rank)
+        # q_normed.shape == (batch_size, seq_len, q_lora_rank)
+        # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
         return self.q_b_proj(self.q_norm(self.q_a_proj(hidden_states)))
 
     def forward(
@@ -366,20 +383,36 @@ class MultiHeadLatentAttention(nn.Module):
         past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        # hidden_states.shape == (batch_size, seq_len, hidden_size)
         batch_size, seq_len, _ = hidden_states.shape
 
+        # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
         q = self._project_query(hidden_states)
+        # q.shape == (batch_size, num_heads, seq_len, qk_head_dim)
         q = q.reshape(batch_size, seq_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
+        # q_nope.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim)
+        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
+        # kv.shape == (batch_size, seq_len, kv_lora_rank + qk_rope_head_dim)
         kv = self.kv_a_proj(hidden_states)
+        # kv_latent.shape == (batch_size, seq_len, kv_lora_rank)
+        # k_pe.shape == (batch_size, seq_len, qk_rope_head_dim)
         kv_latent, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # kv_latent.shape == (batch_size, seq_len, kv_lora_rank)
         kv_latent = self.kv_norm(kv_latent)
+        # kv.shape == (batch_size, seq_len, num_heads * (qk_nope_head_dim + v_head_dim))
         kv = self.kv_b_proj(kv_latent)
+        # kv.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim + v_head_dim)
         kv = kv.reshape(batch_size, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
+        # k_nope.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim)
+        # v.shape == (batch_size, num_heads, seq_len, v_head_dim)
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
+        # cos.shape == sin.shape == (batch_size, seq_len, qk_rope_head_dim)
         cos, sin = position_embeddings
+        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
+        # k_pe.unsqueeze(1).shape == (batch_size, 1, seq_len, qk_rope_head_dim)
         q_pe, k_pe = apply_rotary_pos_emb_interleave(
             q_pe,
             k_pe.unsqueeze(1),
@@ -388,14 +421,21 @@ class MultiHeadLatentAttention(nn.Module):
             position_ids=None,
             unsqueeze_dim=1,
         )
+        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
+        # k_pe.shape == (batch_size, 1, seq_len, qk_rope_head_dim)
 
+        # q.shape == (batch_size, num_heads, seq_len, qk_head_dim)
         q = torch.cat([q_nope, q_pe], dim=-1)
+        # k.shape == (batch_size, num_heads, seq_len, qk_head_dim)
         k = torch.cat([k_nope, k_pe.expand(-1, self.num_heads, -1, -1)], dim=-1)
 
         if past_key_values is not None:
+            # k.shape == (batch_size, num_heads, total_seq_len, qk_head_dim)
+            # v.shape == (batch_size, num_heads, total_seq_len, v_head_dim)
             k, v = past_key_values.update(k, v, self.layer_idx)
 
         attention_interface = get_attention_interface("eager")
+        # output.shape == (batch_size, seq_len, num_heads, v_head_dim)
         output, _ = attention_interface(
             self,
             q,
@@ -407,9 +447,137 @@ class MultiHeadLatentAttention(nn.Module):
             **kwargs,
         )
 
+        # output.shape == (batch_size, seq_len, num_heads * v_head_dim)
         output = output.reshape(batch_size, seq_len, -1)
+        # output.shape == (batch_size, seq_len, hidden_size)
         output = self.residual_dropout(self.out_proj(output))
         return output
+
+
+class MyMLA(nn.Module):
+    def __init__(self, config: MyMiniMindConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+
+        self.hidden_size = config.hidden_size
+        self.n_heads = config.num_attention_heads
+        self.n_local_heads = self.n_heads // 1
+
+        self.q_lora_rank = config.mla_q_lora_rank
+        self.kv_lora_rank = config.mla_kv_lora_rank
+
+        self.qk_nope_head_dim = config.mla_qk_nope_head_dim
+        self.qk_rope_head_dim = config.mla_qk_rope_head_dim
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.v_head_dim = config.mla_v_head_dim
+
+        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank)
+        self.q_norm = RMSNorm(self.q_lora_rank)
+        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+
+        self.wkv_a = nn.Linear(self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim)
+        self.kv_norm = RMSNorm(self.kv_lora_rank)
+        self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+
+        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.hidden_size)
+        self.softmax_scale = self.qk_head_dim ** -0.5
+        self.scale_fmt = config.scale_fmt
+
+        self.dequant_wkv_b = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        past_key_values: Cache | None = None,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        # hidden_states.shape == (batch_size, seq_len, hidden_size)
+        batch_size, seq_len, _ = hidden_states.shape
+        n_heads = self.n_heads
+        qk_head_dim = self.qk_head_dim
+
+        # qr.shape == (batch_size, seq_len, q_lora_rank)
+        qr: torch.Tensor = self.q_norm(self.wq_a(hidden_states))
+        # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
+        q: torch.Tensor = self.wq_b(qr)
+        # q.shape == (batch_size, num_heads, seq_len, qk_head_dim)
+        q = q.view(batch_size, seq_len, n_heads, qk_head_dim).transpose(1, 2)
+        # q_nope.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim)
+        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
+        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        # kv.shape == (batch_size, seq_len, kv_lora_rank + qk_rope_head_dim)
+        kv = self.wkv_a(hidden_states)
+        # kv.shape == (batch_size, seq_len, kv_lora_rank)
+        # k_pe.shape == (batch_size, seq_len, qk_rope_head_dim)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv = self.kv_norm(kv)
+        
+        cos, sin = position_embeddings
+        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
+        # k_pe.shape == (batch_size, 1, seq_len, qk_rope_head_dim)
+        q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe.unsqueeze(1), cos, sin, position_ids=None, unsqueeze_dim=1)
+        # k_pe.shape == (batch_size, seq_len, qk_rope_head_dim)
+        k_pe = k_pe.squeeze(1)
+
+        total_seq_len = seq_len
+        if past_key_values is not None:
+            # kv.shape == (batch_size, total_seq_len, kv_lora_rank)
+            # k_pe.shape == (batch_size, total_seq_len, qk_rope_head_dim)
+            kv, k_pe = past_key_values.update(kv, k_pe, self.layer_idx)
+            total_seq_len = kv.shape[1]
+
+        # prefill
+        if seq_len > 1:
+            # q.shape == (batch_size, num_heads, seq_len, qk_head_dim)
+            q = torch.cat([q_nope, q_pe], dim=-1)
+            # kv.shape == (batch_size, total_seq_len, n_heads * (qk_nope_head_dim + v_head_dim))
+            kv: torch.Tensor = self.wkv_b(kv)
+            # kv.shape == (batch_size, n_heads, total_seq_len, qk_nope_head_dim + v_head_dim)
+            kv = kv.view(batch_size, total_seq_len, n_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
+            # k_nope.shape == (batch_size, num_heads, total_seq_len, qk_nope_head_dim)
+            # v.shape == (batch_size, num_heads, total_seq_len, v_head_dim)
+            k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            # k.shape == (batch_size, num_heads, total_seq_len, qk_nope_head_dim + qk_rope_head_dim) == (batch_size, num_heads, total_seq_len, qk_head_dim)
+            k = torch.cat([k_nope, k_pe[:, None, :, :].expand(-1, n_heads, -1, -1)], dim=-1)
+
+            # scores.shape == (batch_size, num_heads, seq_len, total_seq_len)
+            scores: torch.Tensor = torch.einsum("bhid,bhjd->bhij", q, k) * self.softmax_scale
+            # scores.shape == (batch_size, num_heads, seq_len, total_seq_len)
+            scores = scores + attention_mask if attention_mask is not None else scores
+            scores = scores.softmax(-1)
+
+            # x.shape == (batch_size, num_heads, seq_len, v_head_dim)
+            x = torch.einsum("bhij,bhjd->bhid", scores, v)
+        else:
+            # wkv_b.shape == (num_heads * (qk_nope_head_dim + v_head_dim), kv_lora_rank)
+            wkv_b = self.wkv_b.weight if self.dequant_wkv_b is None else self.dequant_wkv_b
+            # wkv_b.shape == (num_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
+            wkv_b = wkv_b.view(self.n_heads, -1, self.kv_lora_rank)
+            # q_nope.shape == (batch_size, num_heads, seq_len, kv_lora_rank)
+            q_nope = torch.einsum("bhid,hdc->bhic", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+
+            # scores.shape == (batch_size, num_heads, seq_len, total_seq_len)
+            scores = (torch.einsum("bhic,bjc->bhij", q_nope, kv[:batch_size]) + 
+                      torch.einsum("bhir,bjr->bhij", q_pe, k_pe[:batch_size])) * self.softmax_scale
+            
+            # scores.shape == (batch_size, num_heads, seq_len, total_seq_len)
+            scores = scores + attention_mask if attention_mask is not None else scores
+            # scores.shape == (batch_size, num_heads, seq_len, total_seq_len)
+            scores = scores.softmax(-1)
+            # x.shape == (batch_size, num_heads, seq_len, kv_lora_rank)
+            x = torch.einsum("bhij,bjc->bhic", scores, kv[:batch_size])
+            # x.shape == (batch_size, num_heads, seq_len, v_head_dim)
+            x = torch.einsum("bhic,hdc->bhid", x, wkv_b[:, -self.v_head_dim:])
+
+        # x.shape == (batch_size, seq_len, num_heads * v_head_dim)
+        x = x.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        # x.shape == (batch_size, seq_len, hidden_size)
+        x = self.wo(x)
+        return x
 
 
 def build_attention_layer(config: MyMiniMindConfig, layer_idx: int) -> nn.Module:
@@ -417,7 +585,8 @@ def build_attention_layer(config: MyMiniMindConfig, layer_idx: int) -> nn.Module
     if attention_type == "gqa":
         return GroupQueryAttention(config, layer_idx)
     if attention_type == "mla":
-        return MultiHeadLatentAttention(config, layer_idx)
+        # return MultiHeadLatentAttention(config, layer_idx)
+        return MyMLA(config, layer_idx)
     raise ValueError(f"Unsupported attention_type={attention_type!r}.")
 
 

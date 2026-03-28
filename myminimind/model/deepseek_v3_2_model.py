@@ -573,55 +573,96 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
+        # x.shape == (bsz, seq_len, dim)
         bsz, seqlen, _ = x.size()
         end_pos = start_pos + seqlen
+
+        # qr.shape == (bsz, seq_len, q_lora_rank)
         qr = self.q_norm(self.wq_a(x))
+        # q.shape == (bsz, seq_len, n_local_heads * qk_head_dim)
         q = self.wq_b(qr)
+        # q.shape == (bsz, seq_len, n_local_heads, qk_head_dim)
         q = q.view(bsz, seqlen, self.n_local_heads, self.qk_head_dim)
+        # q_nope.shape == (bsz, seq_len, n_local_heads, qk_nope_head_dim)
+        # q_pe.shape == (bsz, seq_len, n_local_heads, qk_rope_head_dim)
         q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        # q_pe.shape == (bsz, seq_len, n_local_heads, qk_rope_head_dim)
         q_pe = apply_rotary_emb(q_pe, freqs_cis)
+
+        # kv.shape == (bsz, seq_len, kv_lora_rank + qk_rope_head_dim)
         kv = self.wkv_a(x)
+        # kv.shape == (bsz, seq_len, kv_lora_rank)
+        # k_pe.shape == (bsz, seq_len, qk_rope_head_dim)
         kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        # kv.shape == (bsz, seq_len, kv_lora_rank)
         kv = self.kv_norm(kv)
+        # k_pe.unsqueeze(2).shape == (bsz, seq_len, 1, qk_rope_head_dim)
+        # k_pe.shape == (bsz, seq_len, 1, qk_rope_head_dim)
         k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
         # we use fp8 kv cache in actual deployment, so here we simulate the precision by casting kv to fp8 and then back to bf16.
+        # kv_fp8.shape == (bsz, seq_len, kv_lora_rank)
+        # kv_scale.shape == (bsz, seq_len, kv_lora_rank // block_size)
         kv_fp8, kv_scale = act_quant(kv, block_size, self.scale_fmt)
+        # kv.shape == (bsz, seq_len, kv_lora_rank)
         kv = (kv_fp8.view(-1, block_size).float() * kv_scale.view(-1, 1)).to(kv.dtype).view_as(kv)
+        # kv_cache[:bsz, start_pos:end_pos].shape == (bsz, seq_len, kv_lora_rank)
         self.kv_cache[:bsz, start_pos:end_pos] = kv
+        # pe_cache[:bsz, start_pos:end_pos].shape == (bsz, seq_len, qk_rope_head_dim)
         self.pe_cache[:bsz, start_pos:end_pos] = k_pe.squeeze(2)
         if mask is not None:    # MHA prefill
+            # q.shape == (bsz, seq_len, n_local_heads, qk_head_dim)
             q = torch.cat([q_nope, q_pe], dim=-1)
+            # kv.shape == (bsz, seq_len, n_local_heads * (qk_nope_head_dim + v_head_dim))
             kv = self.wkv_b(kv)
+            # kv.shape == (bsz, seq_len, n_local_heads, qk_nope_head_dim + v_head_dim)
             kv = kv.view(bsz, seqlen, self.n_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+            # k_nope.shape == (bsz, seq_len, n_local_heads, qk_nope_head_dim)
+            # v.shape == (bsz, seq_len, n_local_heads, v_head_dim)
             k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            # k.shape == (bsz, seq_len, n_local_heads, qk_head_dim)
             k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_local_heads, -1)], dim=-1)
+            # scores.shape == (bsz, seq_len, n_local_heads, seq_len)
             scores = torch.einsum("bshd,bthd->bsht", q, k).mul_(self.softmax_scale)
 
             # indexer
+            # topk_indices.shape == (bsz, seq_len, min(index_topk, end_pos))
             topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+            # index_mask.shape == (bsz, seq_len, seq_len)
             index_mask = torch.full((bsz, seqlen, seqlen), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
             index_mask += mask
             scores += index_mask.unsqueeze(2)
 
+            # scores.shape == (bsz, seq_len, n_local_heads, seq_len)
             scores = scores.softmax(dim=-1)
+            # x.shape == (bsz, seq_len, n_local_heads, v_head_dim)
             x = torch.einsum("bsht,bthd->bshd", scores, v)
         else:                   # MQA decode
             if self.dequant_wkv_b is None and self.wkv_b.scale is not None:
                 self.dequant_wkv_b = weight_dequant(self.wkv_b.weight, self.wkv_b.scale)
             wkv_b = self.wkv_b.weight if self.dequant_wkv_b is None else self.dequant_wkv_b
+            # wkv_b.shape == (n_local_heads, qk_nope_head_dim + v_head_dim, kv_lora_rank)
             wkv_b = wkv_b.view(self.n_local_heads, -1, self.kv_lora_rank)
+            # q_nope.shape == (bsz, seq_len, n_local_heads, kv_lora_rank)
             q_nope = torch.einsum("bshd,hdc->bshc", q_nope, wkv_b[:, :self.qk_nope_head_dim])
+            # scores.shape == (bsz, seq_len, n_local_heads, end_pos)
             scores = (torch.einsum("bshc,btc->bsht", q_nope, self.kv_cache[:bsz, :end_pos]) +
                       torch.einsum("bshr,btr->bsht", q_pe, self.pe_cache[:bsz, :end_pos])) * self.softmax_scale
 
             # indexer
+            # topk_indices.shape == (bsz, seq_len, min(index_topk, end_pos))
             topk_indices = self.indexer(x, qr, start_pos, freqs_cis, mask)
+            # index_mask.shape == (bsz, 1, end_pos)
             index_mask = torch.full((bsz, 1, end_pos), float("-inf"), device=x.device).scatter_(-1, topk_indices, 0)
             scores += index_mask.unsqueeze(2)
 
+            # scores.shape == (bsz, seq_len, n_local_heads, end_pos)
             scores = scores.softmax(dim=-1)
+            # x.shape == (bsz, seq_len, n_local_heads, kv_lora_rank)
             x = torch.einsum("bsht,btc->bshc", scores, self.kv_cache[:bsz, :end_pos])
+            # x.shape == (bsz, seq_len, n_local_heads, v_head_dim)
             x = torch.einsum("bshc,hdc->bshd", x, wkv_b[:, -self.v_head_dim:])
+        # x.flatten(2).shape == (bsz, seq_len, n_local_heads * v_head_dim)
+        # x.shape == (bsz, seq_len, dim)
         x = self.wo(x.flatten(2))
         return x
 

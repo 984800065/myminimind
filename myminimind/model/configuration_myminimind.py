@@ -86,15 +86,16 @@ class MyMiniMindConfig(PretrainedConfig):
         hidden_size: int = 1024,
         intermediate_size: int | None = None,
         max_seq_len: int = 2048,
-        num_attention_heads: int = 8,
+        num_attention_heads: int = 4,
         num_hidden_layers: int = 8,
         group_num: int = 4,
         attention_type: str = "gqa",
-        mla_q_lora_rank: int = 0,
+        mla_q_lora_rank: int | None = None,
         mla_kv_lora_rank: int | None = None,
         mla_qk_nope_head_dim: int | None = None,
         mla_qk_rope_head_dim: int | None = None,
         mla_v_head_dim: int | None = None,
+        scale_fmt: str | None = None,
         vocab_size: int = 6400,
         rms_norm_eps: float = 1e-5,
         rope_base: int = 1_000_000,
@@ -172,10 +173,13 @@ class MyMiniMindConfig(PretrainedConfig):
         if default_mla_rope_head_dim <= 0:
             raise ValueError("MLA requires an even rotary head dimension greater than 0.")
 
+        default_mla_lora_rank = max(1, head_dim // 4)
+        if mla_q_lora_rank is None:
+            mla_q_lora_rank = default_mla_lora_rank
         if mla_q_lora_rank < 0:
             raise ValueError(f"mla_q_lora_rank must be >= 0, got {mla_q_lora_rank}.")
         if mla_kv_lora_rank is None:
-            mla_kv_lora_rank = max(1, hidden_size // 2)
+            mla_kv_lora_rank = default_mla_lora_rank
         if mla_kv_lora_rank <= 0:
             raise ValueError(f"mla_kv_lora_rank must be > 0, got {mla_kv_lora_rank}.")
 
@@ -212,6 +216,7 @@ class MyMiniMindConfig(PretrainedConfig):
             if attention_type == "mla"
             else 1.0
         )
+        self.scale_fmt = scale_fmt
 
         # RoPE configurations
         self.rope_base = rope_base
