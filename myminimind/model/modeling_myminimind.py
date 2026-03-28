@@ -472,19 +472,35 @@ class MyMLA(nn.Module):
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.mla_v_head_dim
 
-        self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank)
-        self.q_norm = RMSNorm(self.q_lora_rank)
-        self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim)
+        if self.q_lora_rank > 0:
+            self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
+            self.q_norm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False)
+            self.q_proj = None
+        else:
+            self.q_proj = nn.Linear(self.hidden_size, self.n_heads * self.qk_head_dim, bias=False)
+            self.wq_a = None
+            self.q_norm = None
+            self.wq_b = None
 
-        self.wkv_a = nn.Linear(self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim)
-        self.kv_norm = RMSNorm(self.kv_lora_rank)
-        self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        self.wkv_a = nn.Linear(self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
+        self.kv_norm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
 
-        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.hidden_size)
+        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.hidden_size, bias=False)
         self.softmax_scale = self.qk_head_dim ** -0.5
         self.scale_fmt = config.scale_fmt
 
         self.dequant_wkv_b = None
+
+    def _project_query(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.q_proj is not None:
+            return self.q_proj(hidden_states)
+
+        assert self.wq_a is not None
+        assert self.q_norm is not None
+        assert self.wq_b is not None
+        return self.wq_b(self.q_norm(self.wq_a(hidden_states)))
 
     def forward(
         self,
@@ -499,10 +515,8 @@ class MyMLA(nn.Module):
         n_heads = self.n_heads
         qk_head_dim = self.qk_head_dim
 
-        # qr.shape == (batch_size, seq_len, q_lora_rank)
-        qr: torch.Tensor = self.q_norm(self.wq_a(hidden_states))
         # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
-        q: torch.Tensor = self.wq_b(qr)
+        q: torch.Tensor = self._project_query(hidden_states)
         # q.shape == (batch_size, num_heads, seq_len, qk_head_dim)
         q = q.view(batch_size, seq_len, n_heads, qk_head_dim).transpose(1, 2)
         # q_nope.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim)
