@@ -131,8 +131,39 @@ def get_model_params(model: MyMiniMindForCausalLM, config: MyMiniMindConfig):
         logger.info(f"Model Params: {total:.2f}M ({attention_type})")
 
 
-def init_model(lm_config: MyMiniMindConfig, from_weight: str, tokenizer_path: str, save_dir: str, device: str) -> tuple[MyMiniMindForCausalLM, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+def load_tokenizer(tokenizer_path: str) -> AutoTokenizer:
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token is None:
+            raise ValueError(f"Tokenizer {tokenizer_path!r} 缺少 pad_token 和 eos_token，当前训练入口无法自动补齐。")
+        tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def sync_lm_config_with_tokenizer(lm_config: MyMiniMindConfig, tokenizer: AutoTokenizer) -> MyMiniMindConfig:
+    lm_config.vocab_size = len(tokenizer)
+    lm_config.bos_token_id = tokenizer.bos_token_id
+    lm_config.eos_token_id = tokenizer.eos_token_id
+    lm_config.pad_token_id = tokenizer.pad_token_id
+    return lm_config
+
+
+def resolve_lm_config_and_tokenizer(lm_config_kwargs: dict, tokenizer_path: str) -> tuple[MyMiniMindConfig, AutoTokenizer]:
+    tokenizer = load_tokenizer(tokenizer_path)
+    lm_config = MyMiniMindConfig(**lm_config_kwargs)
+    sync_lm_config_with_tokenizer(lm_config, tokenizer)
+    return lm_config, tokenizer
+
+
+def init_model(
+    lm_config: MyMiniMindConfig,
+    from_weight: str,
+    tokenizer_path: str,
+    save_dir: str,
+    device: str,
+    tokenizer: AutoTokenizer | None = None,
+) -> tuple[MyMiniMindForCausalLM, AutoTokenizer]:
+    tokenizer = tokenizer if tokenizer is not None else load_tokenizer(tokenizer_path)
     model = MyMiniMindForCausalLM(lm_config)
 
     if from_weight != "none":

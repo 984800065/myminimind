@@ -20,6 +20,8 @@ from myminimind.data import DPODataset
 from myminimind.model.configuration_myminimind import MyMiniMindConfig as MiniMindConfig
 from myminimind.model.modeling_myminimind import (
     MyCausalLMOutputWithPast as CausalLMOutputWithPast,
+)
+from myminimind.model.modeling_myminimind import (
     MyMiniMindForCausalLM as MiniMindForCausalLM,
 )
 from myminimind.utils.logger import logger
@@ -30,6 +32,7 @@ from myminimind.utils.train_utils import (
     init_model,
     is_main_process,
     lm_checkpoint,
+    resolve_lm_config_and_tokenizer,
     setup_seed,
 )
 
@@ -240,7 +243,7 @@ def main():
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg.to_lm_config_kwargs(), cfg.tokenizer_path)
     ckp_data = lm_checkpoint(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir) if cfg.from_resume else None
 
     # ========== 3. 设置混合精度 ==========
@@ -265,6 +268,7 @@ def main():
         tokenizer_path=cfg.tokenizer_path,
         save_dir=cfg.save_dir,
         device=cfg.device,
+        tokenizer=tokenizer,
     )
     if cfg.use_compile:
         model = torch.compile(model)
@@ -277,6 +281,7 @@ def main():
         tokenizer_path=cfg.tokenizer_path,
         save_dir=cfg.save_dir,
         device=cfg.device,
+        tokenizer=tokenizer,
     )
     ref_model.eval()
     ref_model.requires_grad_(False)

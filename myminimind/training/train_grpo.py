@@ -28,6 +28,7 @@ from myminimind.utils.train_utils import (
     init_model,
     is_main_process,
     lm_checkpoint,
+    resolve_lm_config_and_tokenizer,
     setup_seed,
 )
 
@@ -49,7 +50,7 @@ def calculate_rewards(
         matches_pattern_2 = [re.match(pattern2, response, re.S) for response in responses]
 
         format_rewards = []
-        for match_pattern, match_pattern_2 in zip(matches_pattern, matches_pattern_2):
+        for match_pattern, match_pattern_2 in zip(matches_pattern, matches_pattern_2, strict=True):
             if match_pattern or match_pattern_2:
                 format_rewards.append(0.5)
             else:
@@ -166,7 +167,7 @@ def grpo_train_epoch(
             # (batch_size * num_generations, n_keep, vocab_size)
             logits = model(input_ids, logits_to_keep=n_keep + 1).logits[:, :-1, :]
             per_token_logps = []
-            for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:]):
+            for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:], strict=True):
                 # (n_keep, vocab_size)
                 logits_row: torch.Tensor
                 # (n_keep, )
@@ -379,14 +380,7 @@ def main() -> None:
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config = MiniMindConfig(
-        **GRPOConfig().to_lm_config_kwargs()
-        | {
-            "hidden_size": cfg.hidden_size,
-            "num_hidden_layers": cfg.num_hidden_layers,
-            "use_moe": cfg.use_moe,
-        }
-    )
+    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg.to_lm_config_kwargs(), cfg.tokenizer_path)
     ckp_data = lm_checkpoint(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir) if cfg.from_resume else None
 
     # ========== 3. 设置混合精度 ==========
@@ -413,6 +407,7 @@ def main() -> None:
         tokenizer_path=cfg.tokenizer_path,
         save_dir=cfg.save_dir,
         device=cfg.device,
+        tokenizer=tokenizer,
     )
     if cfg.use_compile:
         model = torch.compile(model)
@@ -425,6 +420,7 @@ def main() -> None:
         tokenizer_path=cfg.tokenizer_path,
         save_dir=cfg.save_dir,
         device=cfg.device,
+        tokenizer=tokenizer,
     )
     ref_model = ref_model.eval().requires_grad_(False)
 

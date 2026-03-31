@@ -6,6 +6,8 @@
   - 顶层 `dataset/` 目录中的同名文件如果来自其它项目挂载，不作为当前项目代码入口。
 """
 
+from pathlib import Path
+
 import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
@@ -16,15 +18,43 @@ class PretrainDataset(Dataset):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset("json", data_files=data_path, split="train")
+        dataset_format, data_files = self._resolve_data_source(data_path)
+        self.samples = load_dataset(dataset_format, data_files=data_files, split="train")
+
+    @staticmethod
+    def _resolve_data_source(data_path: str) -> tuple[str, str | list[str]]:
+        path = Path(data_path).expanduser()
+        suffix = path.suffix.lower()
+
+        if suffix in {".json", ".jsonl"}:
+            return "json", str(path)
+        if suffix == ".parquet":
+            return "parquet", str(path)
+
+        if path.is_dir():
+            parquet_files = sorted(str(file) for file in path.glob("*.parquet"))
+            if parquet_files:
+                return "parquet", parquet_files
+
+            json_files = sorted(str(file) for file in path.glob("*.json")) + sorted(str(file) for file in path.glob("*.jsonl"))
+            if json_files:
+                return "json", json_files
+
+            raise FileNotFoundError(f"目录 {path} 中未找到可读取的数据文件（支持 .parquet / .json / .jsonl）")
+
+        raise ValueError(f"无法识别的数据路径: {data_path!r}。请传入 .parquet / .json / .jsonl 文件，或包含这些文件的目录。")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         sample: dict = self.samples[index]
-        tokens = self.tokenizer(str(sample["text"]), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
-        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        prefix_tokens = [self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id is not None else []
+        suffix_tokens = [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else []
+        max_text_length = max(1, self.max_length - len(prefix_tokens) - len(suffix_tokens))
+
+        tokens = self.tokenizer(str(sample["text"]), add_special_tokens=False, max_length=max_text_length, truncation=True).input_ids
+        tokens = prefix_tokens + tokens + suffix_tokens
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
@@ -38,8 +68,8 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset("json", data_files=file_path, split="train")
-        self.bos_id: list[int] = tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False).input_ids
-        self.eos_id: list[int] = tokenizer(f"{tokenizer.eos_token}\n", add_special_tokens=False).input_ids
+        self.bos_id: list[int] = tokenizer(f"{tokenizer.bos_token or ''}assistant\n", add_special_tokens=False).input_ids
+        self.eos_id: list[int] = tokenizer(f"{tokenizer.eos_token or ''}\n", add_special_tokens=False).input_ids
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -89,8 +119,8 @@ class DPODataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding: int = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-        self.bos_id: list[int] = tokenizer(f"{tokenizer.bos_token}assistant\n", add_special_tokens=False).input_ids
-        self.eos_id: list[int] = tokenizer(f"{tokenizer.eos_token}\n", add_special_tokens=False).input_ids
+        self.bos_id: list[int] = tokenizer(f"{tokenizer.bos_token or ''}assistant\n", add_special_tokens=False).input_ids
+        self.eos_id: list[int] = tokenizer(f"{tokenizer.eos_token or ''}\n", add_special_tokens=False).input_ids
         self.sample_pairs = load_dataset("json", data_files=file_path, split="train")
         pass
 
@@ -162,8 +192,8 @@ class RLAIFDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset("json", data_files=jsonl_path, split="train")
-        self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant", add_special_tokens=False).input_ids
-        self.eos_id = tokenizer(f"{tokenizer.eos_token}", add_special_tokens=False).input_ids
+        self.bos_id = tokenizer(f"{tokenizer.bos_token or ''}assistant", add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f"{tokenizer.eos_token or ''}", add_special_tokens=False).input_ids
 
     def __len__(self):
         return len(self.samples)

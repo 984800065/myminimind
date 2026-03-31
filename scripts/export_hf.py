@@ -11,12 +11,11 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
-from transformers import AutoTokenizer
 
 from myminimind.config import get_infer_config
 from myminimind.model.configuration_myminimind import MyMiniMindConfig, load_myminimind_config
 from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM, register_myminimind_for_auto_class
-from myminimind.utils.train_utils import get_model_weight_path
+from myminimind.utils.train_utils import get_model_weight_path, load_tokenizer, sync_lm_config_with_tokenizer
 
 
 def _parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -53,10 +52,12 @@ def _checkpoint_path(
     )
 
 
-def _resolve_model_config(infer_cfg) -> MyMiniMindConfig:
+def _resolve_model_config(infer_cfg, tokenizer) -> MyMiniMindConfig:
     if infer_cfg.model_config_path:
-        return load_myminimind_config(infer_cfg.model_config_path)
-    return MyMiniMindConfig(**infer_cfg.to_lm_config_kwargs())
+        model_config = load_myminimind_config(infer_cfg.model_config_path)
+    else:
+        model_config = MyMiniMindConfig(**infer_cfg.to_lm_config_kwargs())
+    return sync_lm_config_with_tokenizer(model_config, tokenizer)
 
 
 def _preserve_local_tokenizer_files(tokenizer_path: str, output_dir: Path) -> None:
@@ -89,8 +90,8 @@ def main() -> None:
     output_dir = export_args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(infer_cfg.tokenizer_path)
-    model_config = _resolve_model_config(infer_cfg)
+    tokenizer = load_tokenizer(infer_cfg.tokenizer_path)
+    model_config = _resolve_model_config(infer_cfg, tokenizer)
     state_dict = torch.load(checkpoint_path, map_location="cpu")
 
     model = MyMiniMindForCausalLM(model_config)

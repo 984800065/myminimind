@@ -8,7 +8,7 @@ from myminimind.config import get_infer_config
 from myminimind.config.schema import InferConfig
 from myminimind.model.configuration_myminimind import MyMiniMindConfig, load_myminimind_config
 from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM
-from myminimind.utils.train_utils import get_model_params, get_model_weight_path, setup_seed
+from myminimind.utils.train_utils import get_model_params, get_model_weight_path, load_tokenizer, setup_seed, sync_lm_config_with_tokenizer
 
 
 def _checkpoint_path(infer_cfg: InferConfig) -> str:
@@ -21,10 +21,12 @@ def _checkpoint_path(infer_cfg: InferConfig) -> str:
     )
 
 
-def _resolve_model_config(infer_cfg: InferConfig) -> MyMiniMindConfig:
+def _resolve_model_config(infer_cfg: InferConfig, tokenizer) -> MyMiniMindConfig:
     if infer_cfg.model_config_path:
-        return load_myminimind_config(infer_cfg.model_config_path)
-    return MyMiniMindConfig(**infer_cfg.to_lm_config_kwargs())
+        model_config = load_myminimind_config(infer_cfg.model_config_path)
+    else:
+        model_config = MyMiniMindConfig(**infer_cfg.to_lm_config_kwargs())
+    return sync_lm_config_with_tokenizer(model_config, tokenizer)
 
 
 def init_model(infer_cfg: InferConfig) -> tuple[Any, Any]:
@@ -37,8 +39,8 @@ def init_model(infer_cfg: InferConfig) -> tuple[Any, Any]:
         model.eval()
         return model, tokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(infer_cfg.tokenizer_path)
-    model_config = _resolve_model_config(infer_cfg)
+    tokenizer = load_tokenizer(infer_cfg.tokenizer_path)
+    model_config = _resolve_model_config(infer_cfg, tokenizer)
     model = MyMiniMindForCausalLM(model_config)
     ckpt = _checkpoint_path(infer_cfg)
     model.load_state_dict(torch.load(ckpt, map_location=infer_cfg.device), strict=True)
@@ -72,7 +74,7 @@ def main():
             # 启用思考模式
             templates["enable_thinking"] = True
 
-        inputs = tokenizer.apply_chat_template(**templates) if infer_cfg.weight != "pretrain" else (tokenizer.bos_token + prompt)
+        inputs = tokenizer.apply_chat_template(**templates) if infer_cfg.weight != "pretrain" else ((tokenizer.bos_token or "") + prompt)
         inputs: BatchEncoding = tokenizer(inputs, return_tensors="pt", truncation=True)
         inputs = inputs.to(infer_cfg.device)
 

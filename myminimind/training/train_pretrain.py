@@ -35,6 +35,7 @@ from myminimind.utils.train_utils import (
     init_model,
     is_main_process,
     lm_checkpoint,
+    resolve_lm_config_and_tokenizer,
     setup_seed,
 )
 
@@ -211,7 +212,7 @@ def main():
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config = MyMiniMindConfig(**cfg.to_lm_config_kwargs())
+    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg.to_lm_config_kwargs(), cfg.tokenizer_path)
     ckp_data = None
     ds_resume_meta = None
     if cfg.from_resume:
@@ -243,6 +244,7 @@ def main():
         tokenizer_path=cfg.tokenizer_path,
         save_dir=cfg.save_dir,
         device=cfg.device,
+        tokenizer=tokenizer,
     )
     if cfg.use_compile:
         model = torch.compile(model)

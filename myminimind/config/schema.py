@@ -23,6 +23,9 @@ def _default_device() -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
+DEFAULT_TOKENIZER_PATH = "Qwen/Qwen3.5-0.8B"
+
+
 class PretrainConfig(BaseSettings):
     """
     预训练配置：可从 .env、环境变量（TRAIN_*）、配置文件、命令行加载，后者覆盖前者。
@@ -61,12 +64,12 @@ class PretrainConfig(BaseSettings):
     dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
 
     # ----- 数据 -----
-    data_path: str = Field("./dataset/pretrain_hq.jsonl", description="预训练数据路径（jsonl）")
+    data_path: str = Field("/home/dkr/.cache/huggingface/datasets/fineweb/sample/10BT", description="预训练数据路径（jsonl）")
     num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
     max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
 
     # ----- 分词器 -----
-    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
     hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
@@ -134,7 +137,7 @@ class InferConfig(BaseSettings):
     )
 
     # ----- 模型加载 -----
-    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
     save_dir: str = Field("out", description="模型权重目录")
     weight: str = Field("pretrain", description="权重名称前缀（pretrain, full_sft, dpo, rlhf, reason, ppo_actor, grpo, spo）")
     lora_weight: str = Field("None", description="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
@@ -279,7 +282,7 @@ class SFTConfig(BaseSettings):
     max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
 
     # ----- 分词器 -----
-    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
     hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
@@ -355,7 +358,7 @@ class DPOConfig(BaseSettings):
     max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
 
     # ----- 分词器 -----
-    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
     hidden_size: int = Field(512, gt=0, description="隐藏层维度")
@@ -436,7 +439,7 @@ class GRPOConfig(BaseSettings):
     num_generations: int = Field(8, gt=0, description="每个 prompt 生成的样本数")
 
     # ----- 分词器 -----
-    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
     hidden_size: int = Field(512, gt=0, description="隐藏层维度")
@@ -523,7 +526,7 @@ class DistillationConfig(BaseSettings):
     max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
 
     # ----- 分词器 -----
-    tokenizer_path: str = Field("./myminimind/config/tokenizer", description="分词器路径")
+    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
     hidden_size: int = Field(512, gt=0, description="隐藏层维度")
