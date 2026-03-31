@@ -54,12 +54,24 @@ def _add_attention_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mla-v-head-dim", type=int, default=None, dest="mla_v_head_dim")
 
 
+def _add_distributed_launcher_args(parser: argparse.ArgumentParser) -> None:
+    """
+    兼容分布式启动器自动注入的参数。
+
+    这些参数由 deepspeed / torch.distributed.launch 等 launcher 传入；
+    训练逻辑实际从环境变量 LOCAL_RANK 读取，因此这里只负责“接住但忽略”，
+    避免 argparse 因未知参数直接退出。
+    """
+    parser.add_argument("--local_rank", "--local-rank", type=int, default=None, dest="local_rank", help=argparse.SUPPRESS)
+
+
 def _build_pretrain_parser() -> argparse.ArgumentParser:
     """
     构建命令行解析器。所有参数 default=None，表示「没传就不覆盖」：
     这样在 get_pretrain_config() 里只把「用户真正传了」的项覆盖到配置上，没传的用默认或配置文件里的值。
     """
     p = argparse.ArgumentParser(description="MiniMind 预训练")
+    _add_distributed_launcher_args(p)
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
 
     # 保存与输出
@@ -119,6 +131,7 @@ def _build_pretrain_parser() -> argparse.ArgumentParser:
 def _build_infer_parser() -> argparse.ArgumentParser:
     """构建推理/对话命令行解析器。所有参数 default=None，没传则不覆盖配置。"""
     p = argparse.ArgumentParser(description="MiniMind模型推理与对话")
+    _add_distributed_launcher_args(p)
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
 
     # 模型加载
@@ -180,6 +193,7 @@ def _build_infer_parser() -> argparse.ArgumentParser:
 def _build_sft_parser() -> argparse.ArgumentParser:
     """构建 Full SFT 命令行解析器。所有参数 default=None，没传则不覆盖配置。"""
     p = argparse.ArgumentParser(description="MiniMind Full SFT")
+    _add_distributed_launcher_args(p)
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
 
     # 保存与输出
@@ -228,6 +242,7 @@ def _build_sft_parser() -> argparse.ArgumentParser:
 def _build_dpo_parser() -> argparse.ArgumentParser:
     """构建 DPO 命令行解析器。所有参数 default=None，没传则不覆盖配置。"""
     p = argparse.ArgumentParser(description="MiniMind DPO (Direct Preference Optimization)")
+    _add_distributed_launcher_args(p)
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
 
     # 保存与输出
@@ -279,6 +294,7 @@ def _build_dpo_parser() -> argparse.ArgumentParser:
 def _build_grpo_parser() -> argparse.ArgumentParser:
     """构建 GRPO 命令行解析器。所有参数 default=None，没传则不覆盖配置。"""
     p = argparse.ArgumentParser(description="MiniMind GRPO (Group Relative Policy Optimization)")
+    _add_distributed_launcher_args(p)
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
 
     # 保存与输出
@@ -335,6 +351,7 @@ def _build_grpo_parser() -> argparse.ArgumentParser:
 def _build_distillation_parser() -> argparse.ArgumentParser:
     """构建 On-policy 蒸馏命令行解析器。所有参数 default=None，没传则不覆盖配置。"""
     p = argparse.ArgumentParser(description="MiniMind On-policy Distillation (白盒蒸馏)")
+    _add_distributed_launcher_args(p)
     p.add_argument("--config", type=Path, default=None, help="配置文件路径 (json/yaml)")
 
     # 保存与输出

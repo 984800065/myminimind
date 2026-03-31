@@ -6,15 +6,28 @@ cd "$ROOT_DIR"
 
 export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 
-NGPUS="${NGPUS:-1}"
 MODULE="myminimind.training.train_pretrain"
 DEEPSPEED_BIN="${DEEPSPEED_BIN:-$ROOT_DIR/.venv/bin/deepspeed}"
+SAVE_DIR="${SAVE_DIR:-out}"
+SAVE_WEIGHT="${SAVE_WEIGHT:-pretrain}"
+DATA_PATH="${DATA_PATH:-./dataset/pretrain_hq.jsonl}"
+ZERO_STAGE="${ZERO_STAGE:-2}"
+
+if [[ -n "${NGPUS:-}" ]]; then
+  NGPUS="$NGPUS"
+elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -r -a VISIBLE_GPUS <<< "$CUDA_VISIBLE_DEVICES"
+  NGPUS="${#VISIBLE_GPUS[@]}"
+else
+  NGPUS=1
+fi
 
 COMMON_ARGS=(
-  --save-dir out
-  --save-weight pretrain
-  --data-path ./dataset/pretrain_hq.jsonl
+  --save-dir "$SAVE_DIR"
+  --save-weight "$SAVE_WEIGHT"
+  --data-path "$DATA_PATH"
   --use-deepspeed 1
+  --deepspeed-zero-stage "$ZERO_STAGE"
 )
 
 if [[ ! -x "$DEEPSPEED_BIN" ]]; then

@@ -119,7 +119,7 @@ def grpo_train_epoch(
     cfg: GRPOConfig,
     epoch: int,
     loader: DataLoader,
-    one_based_base_iters: int,
+    total_iters: int,
     model: MiniMindForCausalLM,
     ref_model: MiniMindForCausalLM,
     reward_model,
@@ -134,9 +134,11 @@ def grpo_train_epoch(
 ) -> None:
     model.train()
 
-    pbar = tqdm(loader, total=one_based_base_iters, initial=zero_based_start_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
+    pbar = tqdm(loader, total=total_iters, initial=zero_based_start_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
 
-    for step, batch in enumerate(pbar):
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, batch in enumerate(pbar, start=zero_based_start_step):
         # len(prompts) == batch_size
         prompts: list[str] = batch["prompt"]
         prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False, padding_side="left", add_special_tokens=False).to(cfg.device)
@@ -224,14 +226,15 @@ def grpo_train_epoch(
         loss = (policy_loss + aux_loss) / cfg.accumulation_steps
         loss.backward()
 
-        if (step + 1) % cfg.accumulation_steps == 0:
+        should_update = ((step + 1) % cfg.accumulation_steps == 0) or (step == total_iters - 1)
+        if should_update:
             if cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
             scheduler.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-        if step % cfg.log_interval == 0 or step == one_based_base_iters - 1:
+        if step % cfg.log_interval == 0 or step == total_iters - 1:
             policy_loss_val = loss.item() * cfg.accumulation_steps
             current_aux_loss = aux_loss.item()
             avg_reward_val = rewards.mean().item()
@@ -263,7 +266,7 @@ def grpo_train_epoch(
                     }
                 )
 
-        if (step % cfg.save_interval == 0 or step == one_based_base_iters - 1) and is_main_process():
+        if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
             ckp = get_model_weight_path(
                 save_dir=cfg.save_dir,
@@ -311,17 +314,12 @@ def train(
     swanlab_: swanlab.Run | None = None,
 ) -> None:
     start_epoch = last_end_epoch
-    # 预先计算每 epoch 的 iters（不考虑 skip）
-    # loader_for_count = DataLoader(train_dataset, batch_size=cfg.batch_size, sampler=train_sampler)
-    # base_iters = len(loader_for_count)
-    base_iters = (len(train_dataset) + cfg.batch_size - 1) // cfg.batch_size
-
     for epoch in range(start_epoch, cfg.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch)
         indices = torch.randperm(len(train_dataset)).tolist()
-        skip = last_end_step + 1
+        skip = (last_end_step + 1) if (epoch == start_epoch and last_end_step >= 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, cfg.batch_size, skip)
         loader = DataLoader(
             train_dataset,
@@ -331,14 +329,12 @@ def train(
         )
 
         if skip > 0:
-            logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 跳过前 {skip} step，从 {skip + 1} 开始")
-            # 1 based step
-            one_based_base_iters = base_iters
+            logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 跳过前 {skip} step，从 step {skip} 开始")
             grpo_train_epoch(
                 cfg,
                 epoch,
                 loader,
-                one_based_base_iters,
+                len(loader) + skip,
                 model,
                 ref_model,
                 reward_model,
@@ -348,18 +344,16 @@ def train(
                 scheduler,
                 autocast_ctx,
                 lm_config,
-                start_step=last_end_step,
+                zero_based_start_step=skip,
                 swanlab_=swanlab_,
             )
         else:
             logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 从头开始训练")
-            # 1 based step
-            one_based_base_iters = base_iters
             grpo_train_epoch(
                 cfg,
                 epoch,
                 loader,
-                one_based_base_iters,
+                len(loader),
                 model,
                 ref_model,
                 reward_model,
@@ -369,7 +363,7 @@ def train(
                 scheduler,
                 autocast_ctx,
                 lm_config,
-                start_step=0,
+                zero_based_start_step=0,
                 swanlab_=swanlab_,
             )
 
@@ -451,7 +445,7 @@ def main() -> None:
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     loader_for_count = DataLoader(train_dataset, batch_size=cfg.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
-    total_optimizer_steps = (iters // cfg.accumulation_steps) * cfg.epochs
+    total_optimizer_steps = max(1, ((iters + cfg.accumulation_steps - 1) // cfg.accumulation_steps) * cfg.epochs)
     scheduler = CosineAnnealingLR(optimizer, T_max=total_optimizer_steps, eta_min=cfg.learning_rate / 10)
 
     # ========== 6. 从 ckp 恢复状态 ==========
@@ -459,7 +453,8 @@ def main() -> None:
     if ckp_data is not None:
         model.load_state_dict(ckp_data["model"])
         optimizer.load_state_dict(ckp_data["optimizer"])
-        scheduler.load_state_dict(ckp_data["scheduler"])
+        if "scheduler" in ckp_data:
+            scheduler.load_state_dict(ckp_data["scheduler"])
         last_end_epoch = ckp_data.get("epoch", 0)
         last_end_step = ckp_data.get("step", -1)
 

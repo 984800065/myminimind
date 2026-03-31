@@ -957,7 +957,7 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
 
         causal_mask = create_causal_mask(
             config=self.config,
-            input_embeds=input_embeds,
+            inputs_embeds=input_embeds,
             attention_mask=attention_mask,
             cache_position=cache_position,
             past_key_values=past_key_values,
@@ -1061,7 +1061,8 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
             # label中句子完成之后的padding token的id被赋值成了-100，因此这些token不计入损失
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
-            assert not math.isnan(loss), f"loss is nan, shift_logits: {shift_logits}, shift_labels: {shift_labels}"
+            if not torch.isfinite(loss).all():
+                raise FloatingPointError(f"loss is not finite, shift_logits: {shift_logits}, shift_labels: {shift_labels}")
 
         if not return_dict:
             output = (logits, present_key_values, hidden_states, aux_loss)

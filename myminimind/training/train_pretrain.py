@@ -49,19 +49,22 @@ def train_epoch(
     scaler: torch.GradScaler | None,
     autocast_ctx: nullcontext | torch.autocast,
     lm_config: MyMiniMindConfig,
-    last_end_step: int = 0,
+    start_step: int = 0,
     swanlab_: swanlab.Run | None = None,
 ) -> None:
     model.train()
     start_time = time.time()
 
-    total_iters = len(loader) + last_end_step + 1
-    pbar = tqdm(loader, total=total_iters, initial=last_end_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
+    total_iters = len(loader) + start_step
+    pbar = tqdm(loader, total=total_iters, initial=start_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
+
+    if not cfg.use_deepspeed:
+        optimizer.zero_grad(set_to_none=True)
 
     epoch_avg_loss = 0.0
     epoch_avg_aux_loss = 0.0
     cur_step = 0
-    for step, (input_ids, labels) in enumerate(pbar, start=last_end_step):
+    for step, (input_ids, labels) in enumerate(pbar, start=start_step):
         input_ids: torch.Tensor
         labels: torch.Tensor
         input_ids = input_ids.to(cfg.device)
@@ -93,16 +96,16 @@ def train_epoch(
             assert scaler is not None, "非 DeepSpeed 模式下 scaler 不应为空"
             scaler.scale(loss).backward()
 
-            # 梯度累计结束，更新参数
-            if (step + 1) % cfg.accumulation_steps == 0:
+            # 只在真正发生参数更新时推进 scheduler；
+            # epoch 末尾不足 accumulation_steps 的剩余梯度也要补一次更新。
+            should_update = ((step + 1) % cfg.accumulation_steps == 0) or (step == total_iters - 1)
+            if should_update:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad()
-
-            # 每一步结束，更新学习率
-            lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                lr_scheduler.step()
 
         if step % cfg.log_interval == 0 or step == total_iters - 1:
             spend_time = time.time() - start_time
@@ -144,6 +147,7 @@ def train_epoch(
                     weight=cfg.save_weight,
                     model=model,
                     optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
                     scaler=scaler,
                     epoch=epoch,
                     step=step,
@@ -185,8 +189,8 @@ def train(
         )
 
         if skip > 0:
-            logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 跳过前 {last_end_step} step，从 {last_end_step + 1} 开始")
-            train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, last_end_step, swanlab_)
+            logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 跳过前 {skip} step，从 step {skip} 开始")
+            train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, skip, swanlab_)
         else:
             logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 从头开始训练")
             train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, 0, swanlab_)
@@ -249,7 +253,9 @@ def main():
     scaler = None if cfg.use_deepspeed else torch.GradScaler(enabled=(cfg.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     cur_rank_total_samples = len(train_sampler) if train_sampler is not None else len(train_dataset)
-    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs * ((cur_rank_total_samples + cfg.batch_size - 1) // cfg.batch_size), eta_min=0.1 * cfg.learning_rate)
+    micro_batches_per_epoch = (cur_rank_total_samples + cfg.batch_size - 1) // cfg.batch_size
+    update_steps_per_epoch = max(1, (micro_batches_per_epoch + cfg.accumulation_steps - 1) // cfg.accumulation_steps)
+    lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs * update_steps_per_epoch, eta_min=0.1 * cfg.learning_rate)
 
     if cfg.use_deepspeed:
         deepspeed = require_deepspeed()
@@ -273,6 +279,8 @@ def main():
     elif ckp_data is not None:
         model.load_state_dict(ckp_data["model"])
         optimizer.load_state_dict(ckp_data["optimizer"])
+        if "lr_scheduler" in ckp_data:
+            lr_scheduler.load_state_dict(ckp_data["lr_scheduler"])
         assert scaler is not None
         scaler.load_state_dict(ckp_data["scaler"])
         last_end_epoch = ckp_data.get("epoch", 0)
