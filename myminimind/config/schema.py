@@ -74,7 +74,7 @@ class PretrainConfig(BaseSettings):
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
     hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
-    use_moe: bool = Field(True, description="是否使用 MoE 架构")
+    use_moe: bool = Field(False, description="是否使用 MoE 架构")
     attention_type: Literal["gqa", "mla"] = Field("gqa", description="注意力实现类型")
     mla_q_lora_rank: int | None = Field(None, ge=0, description="MLA query 低秩投影 rank；None 表示按 hidden_size 自动推导，0 表示直接投影")
     mla_kv_lora_rank: int | None = Field(None, gt=0, description="MLA latent KV rank；None 表示按 hidden_size 自动推导")

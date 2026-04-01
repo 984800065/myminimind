@@ -18,7 +18,7 @@ from tqdm.auto import tqdm
 from myminimind.config import PretrainConfig, get_pretrain_config
 from myminimind.data import PretrainDataset
 from myminimind.model.configuration_myminimind import MyMiniMindConfig
-from myminimind.model.modular_myminimind import MyCausalLMOutputWithPast, MyMiniMindForCausalLM
+from myminimind.model.modeling_myminimind import MyCausalLMOutputWithPast, MyMiniMindForCausalLM
 from myminimind.training.deepspeed_utils import (
     load_deepspeed_engine_checkpoint,
     load_deepspeed_resume_metadata,

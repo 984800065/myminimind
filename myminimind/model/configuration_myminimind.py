@@ -49,32 +49,32 @@ def _normalize_rope_scaling(
 
 class MyMiniMindConfig(PretrainedConfig):
     model_type = "myminimind"
-    base_model_tp_plan = {
-        "layers.*.self_attention.q_proj": "colwise",
-        "layers.*.self_attention.k_proj": "colwise",
-        "layers.*.self_attention.v_proj": "colwise",
-        "layers.*.self_attention.q_a_proj": "colwise",
-        "layers.*.self_attention.q_b_proj": "colwise",
-        "layers.*.self_attention.kv_a_proj": "colwise",
-        "layers.*.self_attention.kv_b_proj": "colwise",
-        "layers.*.self_attention.out_proj": "rowwise",
-        "layers.*.mlp.glu_ffn.gate_proj": "colwise",
-        "layers.*.mlp.glu_ffn.up_proj": "colwise",
-        "layers.*.mlp.glu_ffn.down_proj": "rowwise",
-        "layers.*.mlp.shared_experts.*.gate_proj": "colwise",
-        "layers.*.mlp.shared_experts.*.up_proj": "colwise",
-        "layers.*.mlp.shared_experts.*.down_proj": "rowwise",
-    }
-    base_model_pp_plan = {
-        "embed_tokens": (["input_ids"], ["input_embeds"]),
-        "dropout": (["input_embeds"], ["hidden_states"]),
-        "rotary_emb": (["hidden_states", "position_ids"], ["position_embeddings"]),
-        "layers": (
-            ["hidden_states", "attention_mask", "position_ids", "past_key_values", "use_cache", "position_embeddings"],
-            ["hidden_states"],
-        ),
-        "norm": (["hidden_states"], ["hidden_states"]),
-    }
+    # base_model_tp_plan = {
+    #     "layers.*.self_attention.q_proj": "colwise",
+    #     "layers.*.self_attention.k_proj": "colwise",
+    #     "layers.*.self_attention.v_proj": "colwise",
+    #     "layers.*.self_attention.q_a_proj": "colwise",
+    #     "layers.*.self_attention.q_b_proj": "colwise",
+    #     "layers.*.self_attention.kv_a_proj": "colwise",
+    #     "layers.*.self_attention.kv_b_proj": "colwise",
+    #     "layers.*.self_attention.out_proj": "rowwise",
+    #     "layers.*.mlp.glu_ffn.gate_proj": "colwise",
+    #     "layers.*.mlp.glu_ffn.up_proj": "colwise",
+    #     "layers.*.mlp.glu_ffn.down_proj": "rowwise",
+    #     "layers.*.mlp.shared_experts.*.gate_proj": "colwise",
+    #     "layers.*.mlp.shared_experts.*.up_proj": "colwise",
+    #     "layers.*.mlp.shared_experts.*.down_proj": "rowwise",
+    # }
+    # base_model_pp_plan = {
+    #     "embed_tokens": (["input_ids"], ["input_embeds"]),
+    #     "dropout": (["input_embeds"], ["hidden_states"]),
+    #     "rotary_emb": (["hidden_states", "position_ids"], ["position_embeddings"]),
+    #     "layers": (
+    #         ["hidden_states", "attention_mask", "position_ids", "past_key_values", "use_cache", "position_embeddings"],
+    #         ["hidden_states"],
+    #     ),
+    #     "norm": (["hidden_states"], ["hidden_states"]),
+    # }
 
     def __init__(
         self,
@@ -89,7 +89,7 @@ class MyMiniMindConfig(PretrainedConfig):
         num_attention_heads: int = 4,
         num_hidden_layers: int = 8,
         group_num: int = 4,
-        attention_type: str = "gqa",
+        attention_type: str = "mla",
         mla_q_lora_rank: int | None = None,
         mla_kv_lora_rank: int | None = None,
         mla_qk_nope_head_dim: int | None = None,
@@ -156,10 +156,18 @@ class MyMiniMindConfig(PretrainedConfig):
         self.group_num = group_num
 
         attention_type = attention_type.lower()
-        if attention_type not in {"gqa", "mla"}:
+        attention_name_map = {
+            "gqa": "my_gqa",
+            "mla": "my_mla",
+        }
+
+        if attention_type not in attention_name_map.keys():
             raise ValueError(f"Unsupported attention_type={attention_type!r}. Expected one of: 'gqa', 'mla'.")
         self.attention_type = attention_type
-        self.num_key_value_heads = num_attention_heads if attention_type == "mla" else num_attention_heads // group_num
+
+        self._attn_implementation = attention_name_map[attention_type]
+
+        self.num_key_value_heads = num_attention_heads if attention_type == "mla" else group_num
         # Keep the alias for libraries that probe `num_kv_heads` first.
         self.num_kv_heads = self.num_key_value_heads
 

@@ -1,4 +1,5 @@
 import math
+from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +29,7 @@ except ImportError:
         is_transposed: bool = False,
         has_bias: bool = False,
         has_gate: bool = True,
-    ) -> type[torch.nn.Module]:
+    ) -> type[torch.nn.Module] | Callable[[type[torch.nn.Module]], type[torch.nn.Module]]:
         del is_transposed, has_bias, has_gate
 
         def wrapper(experts_class: type[torch.nn.Module]) -> type[torch.nn.Module]:
@@ -70,52 +71,51 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, posi
     return x * cos + _rotate_half(x) * sin
 
 
-def myminimind_eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
+def myminimind_gqa_eager_attention_forward(
+    self: nn.Module,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    scaling: float | None = None,
     dropout: float = 0.0,
-    **kwargs: Unpack[TransformersKwargs],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if module.num_key_value_groups > 1:
-        key = (
-            key[:, :, None, :, :]
-            .expand(-1, -1, module.num_key_value_groups, -1, -1)
-            .reshape(
-                key.shape[0],
-                module.num_key_value_heads * module.num_key_value_groups,
-                key.shape[2],
-                key.shape[3],
-            )
-        )
-        value = (
-            value[:, :, None, :, :]
-            .expand(-1, -1, module.num_key_value_groups, -1, -1)
-            .reshape(
-                value.shape[0],
-                module.num_key_value_heads * module.num_key_value_groups,
-                value.shape[2],
-                value.shape[3],
-            )
-        )
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # q.shape == (batch_size, num_heads, seq_len, head_dim)
+    batch_size, num_heads, query_len, head_dim = q.shape
 
-    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
+    # k.shape == v.shape == (batch_size, num_heads, seq_len, head_dim)
+    group_num = k.shape[1]
+    group_size = num_heads // group_num
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value).transpose(1, 2).contiguous()
-    return attn_output, attn_weights
+    k = k.repeat_interleave(group_size, dim=1)
+    v = v.repeat_interleave(group_size, dim=1)
+
+    if scaling is None:
+        scaling = head_dim ** -0.5
+        assert scaling
+
+    # attn_score.shape == (batch_size, num_heads, seq_len, seq_len)
+    attn_score: torch.Tensor = torch.einsum("bhid,bhjd->bhij", q, k) * scaling
+
+    if attention_mask is None:
+        attn_score = attn_score
+    else:
+        if attention_mask.dtype == torch.bool:
+            # attention_mask.shape == (batch_size, seq_len)
+            attn_score = attn_score.masked_fill(attention_mask[:, None, None, :].logical_not(), float("-inf"))
+        else:
+            attn_score = attn_score + attention_mask
+
+    attn_score = attn_score.softmax(dim=-1)
+    attn_score = F.dropout(attn_score, p=dropout, training=self.training)
+
+    # output.shape == (batch_size, num_heads, seq_len, head_dim)
+    output = torch.einsum("bhij,bhjd->bhid", attn_score, v)
+    return output, attn_score
 
 
-def get_attention_interface(attn_implementation: str):
-    if hasattr(ALL_ATTENTION_FUNCTIONS, "get_interface"):
-        return ALL_ATTENTION_FUNCTIONS.get_interface(attn_implementation, myminimind_eager_attention_forward)
-    return ALL_ATTENTION_FUNCTIONS.get(attn_implementation, myminimind_eager_attention_forward)
+ALL_ATTENTION_FUNCTIONS.register("my_gqa", myminimind_gqa_eager_attention_forward)
 
 
 class MyBaseModelOutputWithPast(BaseModelOutputWithPast):
@@ -243,8 +243,8 @@ class GroupQueryAttention(nn.Module):
 
         self.group_num = config.group_num
         assert self.num_heads % self.group_num == 0, "num_heads must be divisible by group_num"
-        self.num_key_value_groups = self.group_num
-        self.num_key_value_heads = self.num_heads // self.group_num
+        self.num_key_value_heads = self.group_num
+        self.group_size = self.num_heads // self.group_num
 
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim)
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim)
@@ -295,161 +295,34 @@ class GroupQueryAttention(nn.Module):
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
 
-        attention_interface = get_attention_interface(getattr(self.config, "_attn_implementation", "eager"))
-        output, _ = attention_interface(
+        # attention_interface = get_attention_interface(getattr(self.config, "_attn_implementation", "eager"))
+        # output, _ = attention_interface(
+        #     self,
+        #     q,
+        #     k,
+        #     v,
+        #     attention_mask,
+        #     dropout=0.0 if not self.training else self.attention_dropout,
+        #     scaling=self.scaling,
+        #     **kwargs,
+        # )
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        output: torch.Tensor
+        # output.shape == (batch_size, num_heads, seq_len, head_dim)
+        output, attn_weight = attention_interface(
             self,
             q,
             k,
             v,
-            attention_mask,
+            attention_mask=attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            **kwargs,
         )
 
         # (batch_size, seq_len, num_heads * head_dim) == (batch_size, seq_len, hidden_size)
-        output = output.reshape(batch_size, seq_len, -1)
+        output = output.transpose(1, 2).reshape(batch_size, seq_len, -1)
         # (batch_size, seq_len, hidden_size)
-        output = self.residual_dropout(self.out_proj(output))
-        return output
-
-
-class MultiHeadLatentAttention(nn.Module):
-    def __init__(
-        self,
-        config: MyMiniMindConfig,
-        layer_idx: int,
-    ):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_key_value_heads = self.num_heads
-        self.num_key_value_groups = 1
-
-        self.q_lora_rank = config.mla_q_lora_rank
-        self.kv_lora_rank = config.mla_kv_lora_rank
-        self.qk_nope_head_dim = config.mla_qk_nope_head_dim
-        self.qk_rope_head_dim = config.mla_qk_rope_head_dim
-        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.v_head_dim = config.mla_v_head_dim
-
-        if self.q_lora_rank > 0:
-            self.q_a_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-            self.q_norm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
-            self.q_proj = None
-        else:
-            self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
-            self.q_norm = None
-            self.q_a_proj = None
-            self.q_b_proj = None
-
-        self.kv_a_proj = nn.Linear(self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
-        self.kv_norm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-        )
-        self.out_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
-
-        self.attention_dropout = config.dropout
-        self.residual_dropout = nn.Dropout(config.dropout)
-        self.scaling = self.qk_head_dim**-0.5
-        self.is_flash_attention = False
-
-    def _project_query(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states.shape == (batch_size, seq_len, hidden_size)
-        if self.q_proj is not None:
-            # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
-            return self.q_proj(hidden_states)
-
-        assert self.q_a_proj is not None
-        assert self.q_b_proj is not None
-        assert self.q_norm is not None
-        # q_a.shape == (batch_size, seq_len, q_lora_rank)
-        # q_normed.shape == (batch_size, seq_len, q_lora_rank)
-        # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
-        return self.q_b_proj(self.q_norm(self.q_a_proj(hidden_states)))
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,
-        past_key_values: Cache | None = None,
-        **kwargs: Unpack[TransformersKwargs],
-    ) -> torch.Tensor:
-        # hidden_states.shape == (batch_size, seq_len, hidden_size)
-        batch_size, seq_len, _ = hidden_states.shape
-
-        # q.shape == (batch_size, seq_len, num_heads * qk_head_dim)
-        q = self._project_query(hidden_states)
-        # q.shape == (batch_size, num_heads, seq_len, qk_head_dim)
-        q = q.reshape(batch_size, seq_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
-        # q_nope.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim)
-        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
-        q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-        # kv.shape == (batch_size, seq_len, kv_lora_rank + qk_rope_head_dim)
-        kv = self.kv_a_proj(hidden_states)
-        # kv_latent.shape == (batch_size, seq_len, kv_lora_rank)
-        # k_pe.shape == (batch_size, seq_len, qk_rope_head_dim)
-        kv_latent, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        # kv_latent.shape == (batch_size, seq_len, kv_lora_rank)
-        kv_latent = self.kv_norm(kv_latent)
-        # kv.shape == (batch_size, seq_len, num_heads * (qk_nope_head_dim + v_head_dim))
-        kv = self.kv_b_proj(kv_latent)
-        # kv.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim + v_head_dim)
-        kv = kv.reshape(batch_size, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
-        # k_nope.shape == (batch_size, num_heads, seq_len, qk_nope_head_dim)
-        # v.shape == (batch_size, num_heads, seq_len, v_head_dim)
-        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
-        # cos.shape == sin.shape == (batch_size, seq_len, qk_rope_head_dim)
-        cos, sin = position_embeddings
-        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
-        # k_pe.unsqueeze(1).shape == (batch_size, 1, seq_len, qk_rope_head_dim)
-        q_pe, k_pe = apply_rotary_pos_emb_interleave(
-            q_pe,
-            k_pe.unsqueeze(1),
-            cos=cos,
-            sin=sin,
-            position_ids=None,
-            unsqueeze_dim=1,
-        )
-        # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
-        # k_pe.shape == (batch_size, 1, seq_len, qk_rope_head_dim)
-
-        # q.shape == (batch_size, num_heads, seq_len, qk_head_dim)
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        # k.shape == (batch_size, num_heads, seq_len, qk_head_dim)
-        k = torch.cat([k_nope, k_pe.expand(-1, self.num_heads, -1, -1)], dim=-1)
-
-        if past_key_values is not None:
-            # k.shape == (batch_size, num_heads, total_seq_len, qk_head_dim)
-            # v.shape == (batch_size, num_heads, total_seq_len, v_head_dim)
-            k, v = past_key_values.update(k, v, self.layer_idx)
-
-        attention_interface = get_attention_interface("eager")
-        # output.shape == (batch_size, seq_len, num_heads, v_head_dim)
-        output, _ = attention_interface(
-            self,
-            q,
-            k,
-            v,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-
-        # output.shape == (batch_size, seq_len, num_heads * v_head_dim)
-        output = output.reshape(batch_size, seq_len, -1)
-        # output.shape == (batch_size, seq_len, hidden_size)
         output = self.residual_dropout(self.out_proj(output))
         return output
 
@@ -848,7 +721,7 @@ class MyMiniMindDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size)
 
     def forward(
-        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None, position_ids: torch.LongTensor | None = None, past_key_values: Cache | None = None, use_cache: bool | None = False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs: Unpack[TransformersKwargs]
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None, position_ids: torch.LongTensor | None = None, past_key_values: Cache | None = None, use_cache: bool | None = False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -1088,7 +961,6 @@ __all__ = [
     "FeedForward",
     "GLU_FFN",
     "GroupQueryAttention",
-    "MultiHeadLatentAttention",
     "MoEFeedForward",
     "MoEGate",
     "MyBaseModelOutputWithPast",
