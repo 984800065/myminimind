@@ -26,16 +26,23 @@ def _default_device() -> str:
 DEFAULT_TOKENIZER_PATH = "Qwen/Qwen3.5-0.8B"
 
 
-class PretrainConfig(BaseSettings):
+class BaseConfig(BaseSettings):
     """
-    预训练配置：可从 .env、环境变量（TRAIN_*）、配置文件、命令行加载，后者覆盖前者。
+    通用配置：可从 .env、环境变量（TRAIN_*）、配置文件、命令行加载，后者覆盖前者。
 
-    使用方式：不要手写 PretrainConfig(xxx)，而是用 get_pretrain_config() 得到实例，例如：
-      cfg = get_pretrain_config()
-      cfg.batch_size
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    不要直接使用BaseConfig，而是用它的子类 PretrainConfig、InferConfig、SFTConfig、DPOConfig、GRPOConfig。
     """
+    # ----- 设备与精度 -----
+    # default_factory：用函数在「每次创建实例」时算默认值，这里用来根据有没有 GPU 选 cuda:0 或 cpu
+    device: str = Field(default_factory=_default_device, description="训练设备，如 cuda:0 / cpu")
+    # Literal 表示只能是这两个字符串之一，写错会校验报错
+    dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
 
+
+class TrainConfig(BaseConfig):
+    """
+    训练配置基类
+    """
     # ----- 下面这一块是 pydantic-settings 的配置，控制「从环境变量怎么读」 -----
     model_config = SettingsConfigDict(
         env_prefix="TRAIN_",  # 环境变量前缀：TRAIN_BATCH_SIZE、TRAIN_LEARNING_RATE 等会映射到对应字段
@@ -45,26 +52,23 @@ class PretrainConfig(BaseSettings):
     )
 
     # ----- 保存与输出 -----
-    save_dir: str = Field("out", description="模型/checkpoint 保存目录")
-    save_weight: str = Field("pretrain", description="保存权重文件名前缀")
+    save_dir: str = Field(description="模型/checkpoint 保存目录")
+    save_weight: str = Field(description="保存权重文件名前缀")
+
     save_interval: int = Field(1000, gt=0, description="每 N step 保存一次")
     log_interval: int = Field(100, gt=0, description="每 N step 打一次日志")
 
     # ----- 训练超参 -----
-    epochs: int = Field(1, ge=1, description="训练轮数")
+    epochs: int = Field(description="训练轮数")
+
     batch_size: int = Field(8, gt=0, description="batch size")
     learning_rate: float = Field(5e-4, gt=0.0, description="初始学习率")
-    accumulation_steps: int = Field(8, ge=1, description="梯度累积步数")
+    accumulation_steps: int = Field(4, ge=1, description="梯度累积步数")
     grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
 
-    # ----- 设备与精度 -----
-    # default_factory：用函数在「每次创建实例」时算默认值，这里用来根据有没有 GPU 选 cuda:0 或 cpu
-    device: str = Field(default_factory=_default_device, description="训练设备，如 cuda:0 / cpu")
-    # Literal 表示只能是这两个字符串之一，写错会校验报错
-    dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
-
     # ----- 数据 -----
-    data_path: str = Field("/home/dkr/.cache/huggingface/datasets/fineweb/sample/10BT", description="预训练数据路径（jsonl）")
+    data_path: str = Field(description="预训练数据路径（jsonl）")
+
     num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
     max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
 
@@ -82,13 +86,10 @@ class PretrainConfig(BaseSettings):
     mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
     mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
 
-    # ----- 恢复与续训 -----
-    from_weight: str = Field("none", description="从哪个权重继续训，none 表示从头")
-    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
-
     # ----- 实验与工具 -----
+    swanlab_project: str = Field(description="swanlab 项目名")
+
     use_swanlab: bool = Field(True, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-Pretrain", description="swanlab 项目名")
     use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
 
     # ----- DeepSpeed -----
@@ -119,6 +120,31 @@ class PretrainConfig(BaseSettings):
             "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
             "mla_v_head_dim": self.mla_v_head_dim,
         }
+
+
+class PretrainConfig(TrainConfig):
+    """
+    预训练配置：可从 .env、环境变量（TRAIN_*）、配置文件、命令行加载，后者覆盖前者。
+
+    使用方式：不要手写 PretrainConfig(xxx)，而是用 get_pretrain_config() 得到实例，例如：
+      cfg = get_pretrain_config()
+      cfg.batch_size
+      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    """
+
+    # ----- 保存与输出 -----
+    save_dir: str = Field("out", description="模型/checkpoint 保存目录")
+    save_weight: str = Field("pretrain", description="保存权重文件名前缀")
+
+    # ----- 训练超参 -----
+    epochs: int = Field(1, ge=1, description="训练轮数")
+
+    # ----- 数据 -----
+    data_path: str = Field("/home/dkr/.cache/huggingface/datasets/fineweb/sample/10BT", description="预训练数据路径（jsonl）")
+
+    # ----- 恢复与续训 -----
+    from_weight: str = Field("none", description="从哪个权重继续训，none 表示从头")
+    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
 
 
 class InferConfig(BaseSettings):
