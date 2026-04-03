@@ -27,11 +27,11 @@ from myminimind.model.modeling_myminimind import (
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
     SkipBatchSampler,
-    get_model_weight_path,
     init_distributed,
     init_model,
     is_main_process,
     lm_checkpoint,
+    log_swanlab_training_metrics,
     resolve_lm_config_and_tokenizer,
     setup_seed,
 )
@@ -159,25 +159,26 @@ def train_epoch(
             cur_dpo_loss = cur_loss - cur_aux_loss
             current_lr = lr_scheduler.get_last_lr()[0]
             eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
-            if swanlab_:
-                swanlab_.log({"total_loss": cur_loss, "dpo_loss": cur_dpo_loss, "aux_loss": cur_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min}, step=step)
+            log_swanlab_training_metrics(
+                swanlab_,
+                epoch=epoch,
+                step=step,
+                steps_per_epoch=total_iters,
+                total_epochs=cfg.epochs,
+                learning_rate=current_lr,
+                elapsed_seconds=spend_time,
+                eta_minutes=float(eta_min),
+                train_metrics={
+                    "total_loss": cur_loss,
+                    "dpo_loss": cur_dpo_loss,
+                    "aux_loss": cur_aux_loss,
+                },
+            )
 
         if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
-            ckp = get_model_weight_path(
-                save_dir=cfg.save_dir,
-                weight=cfg.save_weight,
-                hidden_size=lm_config.hidden_size,
-                use_moe=lm_config.use_moe,
-                attention_type=getattr(lm_config, "attention_type", "gqa"),
-            )
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, "_orig_mod", raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(
-                lm_config=lm_config,
-                weight=cfg.save_weight,
+                cfg=cfg,
                 model=model,
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
@@ -185,10 +186,8 @@ def train_epoch(
                 epoch=epoch,
                 step=step,
                 swanlab_=swanlab_,
-                save_dir=cfg.save_dir,
             )
             model.train()
-            del state_dict
 
         del x_chosen, y_chosen, mask_chosen, x_rejected, y_rejected, mask_rejected, x, y, mask
         del ref_outputs, ref_logits, ref_log_probs, outputs, logits, policy_log_probs, dpo_loss, loss
@@ -243,8 +242,8 @@ def main():
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg.to_lm_config_kwargs(), cfg.tokenizer_path)
-    ckp_data = lm_checkpoint(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir) if cfg.from_resume else None
+    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg)
+    ckp_data = lm_checkpoint(cfg) if cfg.from_resume else None
 
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in cfg.device else "cpu"
@@ -263,11 +262,8 @@ def main():
 
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(
+        cfg=cfg,
         lm_config=lm_config,
-        from_weight=cfg.from_weight,
-        tokenizer_path=cfg.tokenizer_path,
-        save_dir=cfg.save_dir,
-        device=cfg.device,
         tokenizer=tokenizer,
     )
     if cfg.use_compile:
@@ -276,11 +272,8 @@ def main():
     logger.info(f"策略模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M")
 
     ref_model, _ = init_model(
+        cfg=cfg,
         lm_config=lm_config,
-        from_weight=cfg.from_weight,
-        tokenizer_path=cfg.tokenizer_path,
-        save_dir=cfg.save_dir,
-        device=cfg.device,
         tokenizer=tokenizer,
     )
     ref_model.eval()

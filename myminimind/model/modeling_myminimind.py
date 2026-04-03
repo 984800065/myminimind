@@ -1,5 +1,4 @@
 import math
-from collections.abc import Callable
 
 import torch
 import torch.nn.functional as F
@@ -7,7 +6,8 @@ from torch import nn
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask
+from transformers.integrations.moe import use_experts_implementation
+from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, create_causal_mask, eager_mask
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
@@ -16,29 +16,6 @@ from transformers.utils.generic import TransformersKwargs
 from .configuration_myminimind import MyMiniMindConfig
 
 SUPPORTED_EXPERTS_IMPLEMENTATIONS = {"eager", "grouped_mm", "batched_mm"}
-
-try:
-    from transformers.integrations.moe import use_experts_implementation
-except ImportError:
-    # `transformers<5` does not provide the MoE dispatch decorator.
-    # Keep the eager implementation available so exported custom code
-    # can still be imported by vLLM's Transformers backend.
-    def use_experts_implementation(
-        experts_class: type[torch.nn.Module] | None = None,
-        *,
-        is_transposed: bool = False,
-        has_bias: bool = False,
-        has_gate: bool = True,
-    ) -> type[torch.nn.Module] | Callable[[type[torch.nn.Module]], type[torch.nn.Module]]:
-        del is_transposed, has_bias, has_gate
-
-        def wrapper(experts_class: type[torch.nn.Module]) -> type[torch.nn.Module]:
-            return experts_class
-
-        if experts_class is not None:
-            return wrapper(experts_class)
-
-        return wrapper
 
 
 def apply_rotary_pos_emb_interleave(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: int | None = None, unsqueeze_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
@@ -59,18 +36,6 @@ def apply_rotary_pos_emb_interleave(q: torch.Tensor, k: torch.Tensor, cos: torch
     return q_embed, k_embed
 
 
-def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: int | None = None) -> torch.Tensor:
-    # x.shape == (batch_size, seq_len, head_dim)
-    # cos.shape == (batch_size, seq_len, head_dim)
-    # sin.shape == (batch_size, seq_len, head_dim)
-
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        # x.shape == (batch_size, seq_len, head_dim)
-        return torch.cat([-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1)
-
-    return x * cos + _rotate_half(x) * sin
-
-
 def myminimind_gqa_eager_attention_forward(
     self: nn.Module,
     q: torch.Tensor,
@@ -81,6 +46,7 @@ def myminimind_gqa_eager_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    
     # q.shape == (batch_size, num_heads, seq_len, head_dim)
     batch_size, num_heads, query_len, head_dim = q.shape
 
@@ -116,6 +82,15 @@ def myminimind_gqa_eager_attention_forward(
 
 
 ALL_ATTENTION_FUNCTIONS.register("my_gqa", myminimind_gqa_eager_attention_forward)
+ALL_MASK_ATTENTION_FUNCTIONS.register("my_gqa", eager_mask)
+
+
+def myminimind_mla_attention_forward(*args, **kwargs):
+    raise NotImplementedError("MyMLA handles attention internally and should not dispatch through ALL_ATTENTION_FUNCTIONS.")
+
+
+ALL_ATTENTION_FUNCTIONS.register("my_mla", myminimind_mla_attention_forward)
+ALL_MASK_ATTENTION_FUNCTIONS.register("my_mla", eager_mask)
 
 
 class MyBaseModelOutputWithPast(BaseModelOutputWithPast):
@@ -124,10 +99,12 @@ class MyBaseModelOutputWithPast(BaseModelOutputWithPast):
     def __init__(
         self,
         aux_loss: torch.Tensor | None = None,
+        mtp_hidden_states: torch.Tensor | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.aux_loss = aux_loss
+        self.mtp_hidden_states = mtp_hidden_states
 
 
 class MyCausalLMOutputWithPast(CausalLMOutputWithPast):
@@ -361,6 +338,7 @@ class MyMLA(nn.Module):
         self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
 
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.hidden_size, bias=False)
+        self.attention_dropout = config.dropout
         self.softmax_scale = self.qk_head_dim ** -0.5
         self.scale_fmt = config.scale_fmt
 
@@ -436,6 +414,7 @@ class MyMLA(nn.Module):
             # scores.shape == (batch_size, num_heads, seq_len, total_seq_len)
             scores = scores + attention_mask if attention_mask is not None else scores
             scores = scores.softmax(-1)
+            scores = F.dropout(scores, p=self.attention_dropout, training=self.training)
 
             # x.shape == (batch_size, num_heads, seq_len, v_head_dim)
             x = torch.einsum("bhij,bhjd->bhid", scores, v)
@@ -455,6 +434,7 @@ class MyMLA(nn.Module):
             scores = scores + attention_mask if attention_mask is not None else scores
             # scores.shape == (batch_size, num_heads, seq_len, total_seq_len)
             scores = scores.softmax(-1)
+            scores = F.dropout(scores, p=self.attention_dropout, training=self.training)
             # x.shape == (batch_size, num_heads, seq_len, kv_lora_rank)
             x = torch.einsum("bhij,bjc->bhic", scores, kv[:batch_size])
             # x.shape == (batch_size, num_heads, seq_len, v_head_dim)
@@ -738,6 +718,64 @@ class MyMiniMindDecoderLayer(nn.Module):
         return hidden_states, aux_loss
 
 
+class MyMiniMindMTPModule(nn.Module):
+    def __init__(self, config: MyMiniMindConfig, mtp_module_idx: int, max_main_model_layer_idx: int):
+        super().__init__()
+        self.config = config
+        # mtp_module_idx >= 1
+        self.mtp_module_idx = mtp_module_idx
+        assert self.mtp_module_idx >= 1, "mtp_module_idx should start from 1"
+        self.layer_idx = max_main_model_layer_idx + mtp_module_idx
+
+        self.embed_dropout = nn.Dropout(config.dropout)
+        self.mtp_layernorm = RMSNorm(config.hidden_size * 2, eps=config.rms_norm_eps)
+        self.linear_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
+        self.decoder_layer = MyMiniMindDecoderLayer(config, layer_idx=self.layer_idx)
+
+        self.rotary_emb = RotaryEmbedding(config=config)
+    
+    def forward(
+        self, 
+        prev_embeds: torch.Tensor,
+        cur_embeds: torch.Tensor,
+        original_position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        original_attention_mask: torch.Tensor,
+        original_position_ids: torch.Tensor,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.training, "MTP module is only for training and should not be used during inference"
+        # prev_embeds.shape == (batch_size, seq_len, hidden_size)
+        # cur_embeds.shape == (batch_size, seq_len, hidden_size)
+
+        # input_embeds.shape == (batch_size, seq_len - mtp_module_idx, hidden_size * 2)
+        input_embeds = torch.cat([prev_embeds[:, self.mtp_module_idx - 1:-1], cur_embeds[:, self.mtp_module_idx:]], dim=-1)
+
+        # hidden_states.shape == (batch_size, seq_len - mtp_module_idx, hidden_size * 2)
+        hidden_states = self.embed_dropout(input_embeds)
+
+        # hidden_states.shape == (batch_size, seq_len - mtp_module_idx, hidden_size)
+        hidden_states = self.linear_proj(self.mtp_layernorm(hidden_states))
+
+        # original_attention_mask.shape == (batch_size, 1, query_length, key_length)
+        # original_position_embeddings[0].shape == original_position_embeddings[1].shape == (batch_size, seq_len, head_dim)
+        # original_position_ids.shape == (1, seq_len)
+
+        # output_hidden_states.shape == (batch_size, seq_len, hidden_size)
+        output_hidden_states = torch.zeros_like(prev_embeds)
+        hidden_states, layer_aux_loss = self.decoder_layer(
+            hidden_states,
+            attention_mask=original_attention_mask[:, :, self.mtp_module_idx:, self.mtp_module_idx:],
+            position_embeddings=(original_position_embeddings[0][:, self.mtp_module_idx:, :], original_position_embeddings[1][:, self.mtp_module_idx:, :]),
+            position_ids=original_position_ids[:, self.mtp_module_idx:],
+            past_key_values=None,
+            use_cache=False,
+            **kwargs,
+        )
+        output_hidden_states[:, self.mtp_module_idx:, :] = hidden_states
+
+        return output_hidden_states, layer_aux_loss
+
+
 class MyMinimindPreTrainedModel(PreTrainedModel):
     config: MyMiniMindConfig
     config_class = MyMiniMindConfig
@@ -776,6 +814,12 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
         self.rotary_emb = RotaryEmbedding(config=config)
 
         assert config.hidden_size % config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
+
+        self.mtp_level = config.mtp_level
+        if self.mtp_level > 0 and not self.training:
+            raise ValueError("MTP modules are only for training and should not be used during inference")
+        self.mtp_layers = nn.ModuleList([MyMiniMindMTPModule(config, mtp_module_idx=i, max_main_model_layer_idx=self.num_hidden_layers - 1) for i in range(1, config.mtp_level + 1)])
+        
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -828,6 +872,7 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
             # 如果你后面的 rotary 实现明确要求 batch 维完全展开，也可以用：
             # position_ids = cache_position.unsqueeze(0).expand(batch_size, -1)
 
+        # causal_mask.shape == (batch_size, 1, query_length, key_length)
         causal_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=input_embeds,
@@ -836,13 +881,20 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
+        assert causal_mask is not None
 
+        # hidden_states.shape == (batch_size, seq_len, hidden_dim)
         hidden_states: torch.Tensor = self.dropout(input_embeds)
+
         # [cos, sin]
+        # cos.shape == sin.shape == (batch_size, seq_len, head_dim)
         position_embeddings: tuple[torch.Tensor, torch.Tensor] = self.rotary_emb(hidden_states, position_ids=position_ids)
         aux_loss = torch.tensor(0.0, device=hidden_states.device)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        mtp_hidden_states = hidden_states.new_zeros((self.mtp_level + 1, *hidden_states.shape))
+
+        for decoder_layer in self.layers[:self.config.num_hidden_layers]:
+            # hidden_states.shape == (batch_size, seq_len, hidden_size)
             hidden_states, layer_aux_loss = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -853,16 +905,38 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
                 **kwargs,
             )
             aux_loss += layer_aux_loss
+        
+        mtp_hidden_states[0] = self.norm(hidden_states)
 
-        hidden_states = self.norm(hidden_states)
+        for i, mtp_layer in enumerate(self.mtp_layers[:self.mtp_level]):
+            # mtp_layer_idx \in [1, mtp_level]
+            mtp_layer_idx = i + 1
+
+            # input_embeds.shape == (batch_size, seq_len, hidden_size)
+            # attention_mask.shape == (batch_size, 1, query_length, key_length)
+            # position_embeddings[0].shape == position_embeddings[1].shape == (batch_size, seq_len, head_dim)
+            # position_ids.shape == (1, seq_len)
+            # hidden_states.shape == (batch_size, seq_len, hidden_size)
+            hidden_states, layer_aux_loss = mtp_layer(
+                prev_embeds=hidden_states,
+                cur_embeds=input_embeds,
+                original_position_embeddings=position_embeddings,
+                original_attention_mask=causal_mask,
+                original_position_ids=position_ids,
+                **kwargs,
+            )
+            aux_loss += layer_aux_loss
+
+            mtp_hidden_states[mtp_layer_idx] = self.norm(hidden_states)
 
         if not return_dict:
-            return hidden_states, past_key_values, aux_loss
+            return mtp_hidden_states, past_key_values, aux_loss
 
         return MyBaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
+            last_hidden_state=mtp_hidden_states[0],
             past_key_values=past_key_values,
             aux_loss=aux_loss,
+            mtp_hidden_states=mtp_hidden_states,
         )
 
 
@@ -875,6 +949,9 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = MyMiniMindModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.mtp_level = config.mtp_level
+        if self.mtp_level > 0 and not self.training:
+            raise ValueError("MTP modules are only for training and should not be used during inference")
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -906,9 +983,9 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
 
     def forward(
         self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, labels: torch.Tensor | None = None, past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, use_cache: bool = False, logits_to_keep: int | torch.Tensor = 0, return_dict: bool | None = None, **kwargs
-    ) -> MyCausalLMOutputWithPast:
+    ) -> MyCausalLMOutputWithPast | tuple:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        model_outputs = self.model(
+        model_outputs: tuple | MyBaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -917,26 +994,36 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
             **kwargs,
         )
         if return_dict:
+            assert isinstance(model_outputs, MyBaseModelOutputWithPast)
             hidden_states = model_outputs.last_hidden_state
             aux_loss = model_outputs.aux_loss
             present_key_values = model_outputs.past_key_values
         else:
+            assert isinstance(model_outputs, tuple)
             hidden_states, present_key_values, aux_loss = model_outputs
-
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        # hidden_states.shape == (batch_size, seq_len, hidden_size)
-        logits: torch.Tensor = self.lm_head(hidden_states[:, slice_indices, :])
+        # hidden_states.shape == (mtp_level + 1, batch_size, seq_len, hidden_size)
+        assert hidden_states is not None
 
         loss: torch.Tensor | None = None
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            # label中句子完成之后的padding token的id被赋值成了-100，因此这些token不计入损失
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+            loss = torch.scalar_tensor(0.0, device=hidden_states.device)
+            for mtp_step in range(self.mtp_level + 1):
+                # logits.shape == (batch_size, seq_len - mtp_step, vocab_size)
+                logits: torch.Tensor = self.lm_head(hidden_states[mtp_step, :, mtp_step:, :])
+                # shift_logits.shape == (batch_size, seq_len - mtp_step - 1, vocab_size)
+                shift_logits = logits[..., :-1, :].contiguous()
+
+                # labels.shape == (batch_size, seq_len)
+                # shift_labels.shape == (batch_size, seq_len - mtp_step - 1)
+                shift_labels = labels[:, mtp_step + 1:].contiguous()
+                # label中句子完成之后的padding token的id被赋值成了-100，因此这些token不计入损失
+                loss = loss + F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
             if not torch.isfinite(loss).all():
                 raise FloatingPointError(f"loss is not finite, shift_logits: {shift_logits}, shift_labels: {shift_labels}")
 
+        # logits.shape == (batch_size, seq_len, vocab_size)
+        logits: torch.Tensor = self.lm_head(hidden_states[0])
         if not return_dict:
             output = (logits, present_key_values, hidden_states, aux_loss)
             return ((loss,) + output) if loss is not None else output

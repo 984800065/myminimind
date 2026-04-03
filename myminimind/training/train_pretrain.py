@@ -5,8 +5,8 @@ MiniMind 预训练入口：get_pretrain_config() 加载参数，DDP + 混合精�
 import os
 import time
 from contextlib import nullcontext
-from typing import Any
 
+import deepspeed
 import swanlab
 import torch
 import torch.distributed as dist
@@ -19,11 +19,10 @@ from myminimind.config import PretrainConfig, get_pretrain_config
 from myminimind.data import PretrainDataset
 from myminimind.model.configuration_myminimind import MyMiniMindConfig
 from myminimind.model.modeling_myminimind import MyCausalLMOutputWithPast, MyMiniMindForCausalLM
-from myminimind.training.deepspeed_utils import (
+from myminimind.utils.deepspeed_utils import (
     load_deepspeed_engine_checkpoint,
     load_deepspeed_resume_metadata,
-    require_deepspeed,
-    resolve_pretrain_deepspeed_config,
+    resolve_deepspeed_config,
     save_deepspeed_checkpoint,
     save_resolved_deepspeed_config,
 )
@@ -35,6 +34,7 @@ from myminimind.utils.train_utils import (
     init_model,
     is_main_process,
     lm_checkpoint,
+    log_swanlab_training_metrics,
     resolve_lm_config_and_tokenizer,
     setup_seed,
 )
@@ -44,7 +44,7 @@ def train_epoch(
     cfg: PretrainConfig,
     epoch: int,
     loader: DataLoader,
-    model: Any,
+    model: DistributedDataParallel | deepspeed.DeepSpeedEngine,
     optimizer: optim.Optimizer,
     lr_scheduler: optim.lr_scheduler.LRScheduler,
     scaler: torch.GradScaler | None,
@@ -91,6 +91,7 @@ def train_epoch(
             pbar.set_postfix({"batch_loss": cur_loss, "epoch_avg_loss": epoch_avg_loss / cur_step, "batch_aux_loss": cur_aux_loss, "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step})
 
         if cfg.use_deepspeed:
+            assert isinstance(model, deepspeed.DeepSpeedEngine), "启用 DeepSpeed 时，模型应为 DeepSpeedEngine 实例"
             model.backward(loss)
             model.step()
         else:
@@ -108,44 +109,51 @@ def train_epoch(
                 optimizer.zero_grad(set_to_none=True)
                 lr_scheduler.step()
 
+        # logging
         if step % cfg.log_interval == 0 or step == total_iters - 1:
             spend_time = time.time() - start_time
             cur_logits_loss = cur_loss - cur_aux_loss
             current_lr = optimizer.param_groups[0]["lr"]
             eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
-            if swanlab_:
-                swanlab_.log({"loss": cur_loss, "logits_loss": cur_logits_loss, "aux_loss": cur_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            log_swanlab_training_metrics(
+                swanlab_,
+                epoch=epoch,
+                step=step,
+                steps_per_epoch=total_iters,
+                total_epochs=cfg.epochs,
+                learning_rate=current_lr,
+                elapsed_seconds=spend_time,
+                eta_minutes=float(eta_min),
+                train_metrics={
+                    "loss": cur_loss,
+                    "logits_loss": cur_logits_loss,
+                    "aux_loss": cur_aux_loss,
+                },
+            )
 
-        if step % cfg.save_interval == 0 or step == total_iters - 1:
+        # ckpt save
+        if (step + 1) % cfg.save_interval == 0 or step == total_iters - 1:
             model.eval()
-            debug_suffix = "_debug" if cfg.debug else ""
-            ckp = get_model_weight_path(
-                save_dir=cfg.save_dir,
-                weight=cfg.save_weight,
-                hidden_size=lm_config.hidden_size,
-                use_moe=lm_config.use_moe,
-                attention_type=lm_config.attention_type,
-            ).removesuffix(".pth") + f"{debug_suffix}.pth"
-            raw_model = model.module if cfg.use_deepspeed or isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, "_orig_mod", raw_model)
-            if is_main_process():
-                state_dict = raw_model.state_dict()
-                torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-                del state_dict
+            
+            # if cfg.save_dir is a relative path, it is relative as-is. Otherwise, cfg.save_dir ans this are both absolute path.
+            check_point_path: str = get_model_weight_path(cfg)
+
             if cfg.use_deepspeed:
+                raw_model = model.module if cfg.use_deepspeed or isinstance(model, DistributedDataParallel) else model
+                raw_model = getattr(raw_model, "_orig_mod", raw_model)
+                if is_main_process():
+                    torch.save(raw_model.state_dict(), check_point_path)
+                    logger.info(f"当前training step为 {step}，已保存模型权重到 {check_point_path}")
                 save_deepspeed_checkpoint(
                     engine=model,
-                    lm_config=lm_config,
-                    weight=cfg.save_weight,
-                    save_dir=cfg.save_dir,
                     epoch=epoch,
                     step=step,
                     swanlab_=swanlab_,
+                    cfg=cfg,
                 )
             elif is_main_process():
                 lm_checkpoint(
-                    lm_config=lm_config,
-                    weight=cfg.save_weight,
+                    cfg=cfg,
                     model=model,
                     optimizer=optimizer,
                     lr_scheduler=lr_scheduler,
@@ -153,7 +161,6 @@ def train_epoch(
                     epoch=epoch,
                     step=step,
                     swanlab_=swanlab_,
-                    save_dir=cfg.save_dir,
                 )
             model.train()
 
@@ -199,8 +206,6 @@ def train(
 
 def main():
     cfg = get_pretrain_config()
-    if cfg.use_deepspeed:
-        require_deepspeed()
     if cfg.use_deepspeed and cfg.use_compile:
         raise ValueError("当前预训练入口暂不建议同时启用 DeepSpeed 与 torch.compile，请先关闭其中一个。")
 
@@ -210,21 +215,21 @@ def main():
         cfg.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
-    # ========== 2. 配置目录、模型参数、检查ckp ==========
+    # ========== 2. 设置混合精度 ==========
+    device_type = "cuda" if "cuda" in cfg.device else "cpu"
+    dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float16
+    autocast_ctx = nullcontext() if (device_type == "cpu" or cfg.use_deepspeed) else torch.autocast(device_type=device_type, dtype=dtype)
+
+    # ========== 3. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg.to_lm_config_kwargs(), cfg.tokenizer_path)
+    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg)
     ckp_data = None
     ds_resume_meta = None
     if cfg.from_resume:
         if cfg.use_deepspeed:
-            ds_resume_meta = load_deepspeed_resume_metadata(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir)
+            ds_resume_meta = load_deepspeed_resume_metadata(cfg)
         else:
-            ckp_data = lm_checkpoint(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir)
-
-    # ========== 3. 设置混合精度 ==========
-    device_type = "cuda" if "cuda" in cfg.device else "cpu"
-    dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if (device_type == "cpu" or cfg.use_deepspeed) else torch.autocast(device_type=device_type, dtype=dtype)
+            ckp_data = lm_checkpoint(cfg)
 
     # ========== 4. 配swanlab ==========
     swanlab_ = None
@@ -239,11 +244,8 @@ def main():
 
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(
+        cfg=cfg,
         lm_config=lm_config,
-        from_weight=cfg.from_weight,
-        tokenizer_path=cfg.tokenizer_path,
-        save_dir=cfg.save_dir,
-        device=cfg.device,
         tokenizer=tokenizer,
     )
     if cfg.use_compile:
@@ -260,9 +262,8 @@ def main():
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs * update_steps_per_epoch, eta_min=0.1 * cfg.learning_rate)
 
     if cfg.use_deepspeed:
-        deepspeed = require_deepspeed()
-        ds_config = resolve_pretrain_deepspeed_config(cfg)
-        save_resolved_deepspeed_config(ds_config, lm_config, cfg.save_weight, cfg.save_dir)
+        ds_config = resolve_deepspeed_config(cfg)
+        save_resolved_deepspeed_config(ds_config, cfg)
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model,
             model_parameters=model.parameters(),
@@ -274,7 +275,7 @@ def main():
     # ========== 6. 从ckp恢复状态 ==========
     last_end_epoch, last_end_step = 0, -1
     if cfg.use_deepspeed:
-        client_state = load_deepspeed_engine_checkpoint(model, lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir) if cfg.from_resume else None
+        client_state = load_deepspeed_engine_checkpoint(model, cfg) if cfg.from_resume else None
         if client_state is not None:
             last_end_epoch = client_state.get("epoch", 0)
             last_end_step = client_state.get("step", -1)

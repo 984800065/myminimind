@@ -12,13 +12,7 @@ from myminimind.utils.train_utils import get_model_params, get_model_weight_path
 
 
 def _checkpoint_path(infer_cfg: InferConfig) -> str:
-    return get_model_weight_path(
-        save_dir=f"./{infer_cfg.save_dir}",
-        weight=infer_cfg.weight,
-        hidden_size=infer_cfg.hidden_size,
-        use_moe=infer_cfg.use_moe,
-        attention_type=infer_cfg.attention_type,
-    )
+    return get_model_weight_path(infer_cfg)
 
 
 def _resolve_model_config(infer_cfg: InferConfig, tokenizer) -> MyMiniMindConfig:

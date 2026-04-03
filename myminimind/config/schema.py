@@ -25,12 +25,71 @@ def _default_device() -> str:
 
 DEFAULT_TOKENIZER_PATH = "Qwen/Qwen3.5-0.8B"
 
+TRAIN_LM_CONFIG_FIELDS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "use_moe",
+    "attention_type",
+    "mla_q_lora_rank",
+    "mla_kv_lora_rank",
+    "mla_qk_nope_head_dim",
+    "mla_qk_rope_head_dim",
+    "mla_v_head_dim",
+    "mtp_level",
+)
+
+INFER_LM_CONFIG_FIELDS = (
+    "hidden_act",
+    "hidden_size",
+    "intermediate_size",
+    "max_seq_len",
+    "num_attention_heads",
+    "num_hidden_layers",
+    "group_num",
+    "attention_type",
+    "mla_q_lora_rank",
+    "mla_kv_lora_rank",
+    "mla_qk_nope_head_dim",
+    "mla_qk_rope_head_dim",
+    "mla_v_head_dim",
+    "vocab_size",
+    "rms_norm_eps",
+    "rope_base",
+    "use_moe",
+    "flash_attention",
+    "num_experts_per_token",
+    "num_routed_experts",
+    "num_shared_experts",
+    "scoring_function",
+    "aux_loss_alpha",
+    "seq_aux",
+    "norm_topk_prob",
+    "capacity_factor",
+    "inference_rope_scaling",
+    "mtp_level",
+)
+
+
+def _settings_config(env_prefix: str) -> SettingsConfigDict:
+    return SettingsConfigDict(
+        env_prefix=env_prefix,
+        env_nested_delimiter="__",
+        extra="ignore",
+        str_strip_whitespace=True,
+    )
+
+
+def _lm_config_kwargs(config: object, field_names: tuple[str, ...], **extra) -> dict:
+    kwargs = {name: getattr(config, name) for name in field_names}
+    kwargs.update(extra)
+    return kwargs
+
 
 class BaseConfig(BaseSettings):
     """
-    通用配置：可从 .env、环境变量（TRAIN_*）、配置文件、命令行加载，后者覆盖前者。
+    训练类配置的公共基类，提供 device / dtype 等共享字段。
 
-    不要直接使用BaseConfig，而是用它的子类 PretrainConfig、InferConfig、SFTConfig、DPOConfig、GRPOConfig。
+    不要直接使用 BaseConfig，而是用它的子类 PretrainConfig、SFTConfig、DPOConfig、GRPOConfig、DistillationConfig。
     """
     # ----- 设备与精度 -----
     # default_factory：用函数在「每次创建实例」时算默认值，这里用来根据有没有 GPU 选 cuda:0 或 cpu
@@ -41,15 +100,10 @@ class BaseConfig(BaseSettings):
 
 class TrainConfig(BaseConfig):
     """
-    训练配置基类
+    训练配置基类，收口大多数训练入口共用的字段和 `to_lm_config_kwargs()`。
     """
     # ----- 下面这一块是 pydantic-settings 的配置，控制「从环境变量怎么读」 -----
-    model_config = SettingsConfigDict(
-        env_prefix="TRAIN_",  # 环境变量前缀：TRAIN_BATCH_SIZE、TRAIN_LEARNING_RATE 等会映射到对应字段
-        env_nested_delimiter="__",  # 嵌套字段用双下划线，如 TRAIN_OPTIM__LR（当前 schema 无嵌套，可忽略）
-        extra="ignore",  # 环境变量里多出来的 key 不报错，直接忽略
-        str_strip_whitespace=True,  # 字符串自动去首尾空格
-    )
+    model_config = _settings_config("TRAIN_")
 
     # ----- 保存与输出 -----
     save_dir: str = Field(description="模型/checkpoint 保存目录")
@@ -57,6 +111,10 @@ class TrainConfig(BaseConfig):
 
     save_interval: int = Field(1000, gt=0, description="每 N step 保存一次")
     log_interval: int = Field(100, gt=0, description="每 N step 打一次日志")
+
+    # ----- 恢复与续训 -----
+    from_weight: str = Field(description="从哪个权重继续训，none 表示从头")
+    from_resume: bool = Field(description="是否自动检测 checkpoint 并续训")
 
     # ----- 训练超参 -----
     epochs: int = Field(description="训练轮数")
@@ -79,12 +137,13 @@ class TrainConfig(BaseConfig):
     hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
     use_moe: bool = Field(False, description="是否使用 MoE 架构")
-    attention_type: Literal["gqa", "mla"] = Field("gqa", description="注意力实现类型")
+    attention_type: Literal["gqa", "mla"] = Field("mla", description="注意力实现类型")
     mla_q_lora_rank: int | None = Field(None, ge=0, description="MLA query 低秩投影 rank；None 表示按 hidden_size 自动推导，0 表示直接投影")
     mla_kv_lora_rank: int | None = Field(None, gt=0, description="MLA latent KV rank；None 表示按 hidden_size 自动推导")
     mla_qk_nope_head_dim: int | None = Field(None, ge=0, description="MLA 中不使用 RoPE 的 Q/K head 维度；None 表示自动推导")
     mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
     mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
+    mtp_level: int = Field(0, ge=0, le=2, description="多token预测数量（0=无多token预测，1=多预测1个token，2=多预测2个token，......）")
 
     # ----- 实验与工具 -----
     swanlab_project: str = Field(description="swanlab 项目名")
@@ -98,7 +157,7 @@ class TrainConfig(BaseConfig):
     deepspeed_zero_stage: Literal[0, 1, 2] = Field(2, description="DeepSpeed ZeRO stage（当前预训练入口建议使用 0/1/2）")
     deepspeed_offload_optimizer: bool = Field(False, description="是否启用 DeepSpeed CPU optimizer offload")
     deepspeed_tensor_parallel_size: int = Field(1, gt=0, description="DeepSpeed AutoTP 大小；1 表示关闭张量并行")
-
+    
     # ------ debug -----
     debug: bool = Field(False, description="是否开启 debug 模式（小数据、频繁保存、详细日志）")
 
@@ -109,17 +168,7 @@ class TrainConfig(BaseConfig):
         用法：lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
         这样训练配置和模型配置解耦，PretrainConfig 管训练，MiniMindConfig 管模型结构。
         """
-        return {
-            "hidden_size": self.hidden_size,
-            "num_hidden_layers": self.num_hidden_layers,
-            "use_moe": self.use_moe,
-            "attention_type": self.attention_type,
-            "mla_q_lora_rank": self.mla_q_lora_rank,
-            "mla_kv_lora_rank": self.mla_kv_lora_rank,
-            "mla_qk_nope_head_dim": self.mla_qk_nope_head_dim,
-            "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
-            "mla_v_head_dim": self.mla_v_head_dim,
-        }
+        return _lm_config_kwargs(self, TRAIN_LM_CONFIG_FIELDS)
 
 
 class PretrainConfig(TrainConfig):
@@ -135,6 +184,10 @@ class PretrainConfig(TrainConfig):
     # ----- 保存与输出 -----
     save_dir: str = Field("out", description="模型/checkpoint 保存目录")
     save_weight: str = Field("pretrain", description="保存权重文件名前缀")
+    
+    # ----- 恢复与续训 -----
+    from_weight: str = Field("none", description="从哪个权重继续训，none 表示从头")
+    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
 
     # ----- 训练超参 -----
     epochs: int = Field(1, ge=1, description="训练轮数")
@@ -142,9 +195,171 @@ class PretrainConfig(TrainConfig):
     # ----- 数据 -----
     data_path: str = Field("/home/dkr/.cache/huggingface/datasets/fineweb/sample/10BT", description="预训练数据路径（jsonl）")
 
+    # ----- 实验与工具 -----
+    swanlab_project: str = Field("MiniMind-Pretrain", description="swanlab 项目名")
+
+
+class SFTConfig(TrainConfig):
+    """
+    Full SFT 配置：可从 .env、环境变量（SFT_*）、配置文件、命令行加载，后者覆盖前者。
+
+    使用方式：用 get_sft_config() 得到实例，例如：
+      cfg = get_sft_config()
+      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    """
+
+    model_config = _settings_config("SFT_")
+
+    # ----- 保存与输出 -----
+    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
+    save_weight: str = Field("full_sft", description="保存权重文件名前缀")
+    epochs: int = Field(1, ge=1, description="训练轮数")
+    learning_rate: float = Field(1e-6, gt=0.0, description="初始学习率")
+    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
+
+    # ----- 数据 -----
+    data_path: str = Field("./dataset/sft_512.jsonl", description="SFT 训练数据路径（jsonl）")
+
+    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    use_moe: bool = Field(True, description="是否使用 MoE 架构")
+
     # ----- 恢复与续训 -----
-    from_weight: str = Field("none", description="从哪个权重继续训，none 表示从头")
+    from_weight: str = Field("pretrain", description="从哪个权重继续训，none 表示从头")
     from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
+
+    # ----- 实验与工具 -----
+    swanlab_project: str = Field("MiniMind-Full-SFT", description="swanlab 项目名")
+
+
+class DPOConfig(TrainConfig):
+    """
+    DPO (Direct Preference Optimization) 配置：可从 .env、环境变量（DPO_*）、配置文件、命令行加载，后者覆盖前者。
+
+    使用方式：用 get_dpo_config() 得到实例，例如：
+      cfg = get_dpo_config()
+      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    """
+
+    model_config = _settings_config("DPO_")
+
+    # ----- 保存与输出 -----
+    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
+    save_weight: str = Field("dpo", description="保存权重文件名前缀")
+    save_interval: int = Field(100, gt=0, description="每 N step 保存一次")
+    epochs: int = Field(1, ge=1, description="训练轮数")
+    batch_size: int = Field(4, gt=0, description="batch size")
+    learning_rate: float = Field(4e-8, gt=0.0, description="初始学习率（建议<=5e-8 避免遗忘）")
+    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
+
+    # ----- 数据 -----
+    data_path: str = Field("./dataset/dpo.jsonl", description="DPO 训练数据路径（jsonl）")
+
+    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
+
+    # ----- 恢复与续训 -----
+    from_weight: str = Field("full_sft", description="基于哪个权重训练")
+    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
+
+    # ----- DPO 专用 -----
+    beta: float = Field(0.1, gt=0.0, description="DPO 中的 beta 参数")
+
+    # ----- 实验与工具 -----
+    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
+    swanlab_project: str = Field("MiniMind-DPO", description="swanlab 项目名")
+
+
+class GRPOConfig(TrainConfig):
+    """
+    GRPO (Group Relative Policy Optimization) 配置：可从 .env、环境变量（GRPO_*）、配置文件、命令行加载，后者覆盖前者。
+
+    使用方式：用 get_grpo_config() 得到实例，例如：
+      cfg = get_grpo_config()
+      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    """
+
+    model_config = _settings_config("GRPO_")
+
+    # ----- 保存与输出 -----
+    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
+    save_weight: str = Field("grpo", description="保存权重文件名前缀")
+    save_interval: int = Field(10, gt=0, description="每 N step 保存一次")
+    log_interval: int = Field(1, gt=0, description="每 N step 打一次日志")
+
+    epochs: int = Field(1, ge=1, description="训练轮数")
+    batch_size: int = Field(2, gt=0, description="batch size")
+    learning_rate: float = Field(8e-8, gt=0.0, description="初始学习率")
+    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
+
+    # ----- 数据 -----
+    data_path: str = Field("./dataset/rlaif-mini.jsonl", description="RLAIF 训练数据路径（jsonl）")
+    max_seq_len: int = Field(66, gt=0, description="Prompt 最大长度")
+    max_gen_len: int = Field(1536, gt=0, description="生成的最大长度")
+    num_generations: int = Field(8, gt=0, description="每个 prompt 生成的样本数")
+
+    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
+
+    # ----- 恢复与续训 -----
+    from_weight: str = Field("none", description="初始化 policy/reference 模型的基础权重；none 表示按 reasoning 自动选择")
+    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
+
+    # ----- GRPO 专用 -----
+    beta: float = Field(0.02, gt=0.0, description="KL 惩罚系数")
+    reasoning: int = Field(1, ge=0, le=1, description="推理模型类型（0=普通模型，1=推理模型）")
+    # reward_model_path: str = Field(
+    #     "../../internlm2-1_8b-reward",
+    #     description="Reward 模型路径",
+    # )
+    reward_model_name: str = Field("internlm/internlm2-1_8b-reward", description="Reward 模型名称")
+    reward_model_tokenizer_name: str = Field("internlm/internlm2-1_8b-reward", description="Reward 模型分词器名称")
+
+    # ----- 实验与工具 -----
+    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
+    swanlab_project: str = Field("MiniMind-GRPO", description="swanlab 项目名")
+
+    def to_lm_config_kwargs(self) -> dict:
+        """抽出模型结构相关字段，传给 MiniMindConfig（供 policy / reference 模型使用）。"""
+        return _lm_config_kwargs(
+            self,
+            TRAIN_LM_CONFIG_FIELDS,
+            max_seq_len=self.max_seq_len + self.max_gen_len,
+        )
+
+
+class DistillationConfig(TrainConfig):
+    """
+    On-policy 白盒蒸馏配置：可从 .env、环境变量（DISTILL_*）、配置文件、命令行加载，后者覆盖前者。
+
+    使用方式：用 get_distillation_config() 得到实例，例如：
+      cfg = get_distillation_config()
+      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+    """
+
+    model_config = _settings_config("DISTILL_")
+
+    # ----- 保存与输出 -----
+    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
+    save_weight: str = Field("distill", description="保存权重文件名前缀")
+    epochs: int = Field(2, ge=1, description="训练轮数")
+    batch_size: int = Field(16, gt=0, description="batch size")
+    learning_rate: float = Field(1e-6, gt=0.0, description="初始学习率")
+    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
+
+    # ----- 数据 -----
+    data_path: str = Field("./dataset/sft_mini_512.jsonl", description="蒸馏训练数据路径（jsonl）")
+    max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
+
+    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
+
+    # ----- 恢复与续训 -----
+    from_weight: str = Field("pretrain", description="基于哪个权重训练，none 表示从头")
+    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
+
+    # ----- 实验与工具 -----
+    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
+    swanlab_project: str = Field("MiniMind-Distillation", description="swanlab 项目名")
 
 
 class InferConfig(BaseSettings):
@@ -155,12 +370,7 @@ class InferConfig(BaseSettings):
     使用方式：用 get_infer_config() 得到实例。
     """
 
-    model_config = SettingsConfigDict(
-        env_prefix="INFER_",
-        env_nested_delimiter="__",
-        extra="ignore",
-        str_strip_whitespace=True,
-    )
+    model_config = _settings_config("INFER_")
 
     # ----- 模型加载 -----
     tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
@@ -222,35 +432,7 @@ class InferConfig(BaseSettings):
 
     def to_lm_config_kwargs(self) -> dict:
         """抽出模型结构相关字段，传给 MiniMindConfig。"""
-        return {
-            "hidden_act": self.hidden_act,
-            "hidden_size": self.hidden_size,
-            "intermediate_size": self.intermediate_size,
-            "max_seq_len": self.max_seq_len,
-            "num_attention_heads": self.num_attention_heads,
-            "num_hidden_layers": self.num_hidden_layers,
-            "group_num": self.group_num,
-            "attention_type": self.attention_type,
-            "mla_q_lora_rank": self.mla_q_lora_rank,
-            "mla_kv_lora_rank": self.mla_kv_lora_rank,
-            "mla_qk_nope_head_dim": self.mla_qk_nope_head_dim,
-            "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
-            "mla_v_head_dim": self.mla_v_head_dim,
-            "vocab_size": self.vocab_size,
-            "rms_norm_eps": self.rms_norm_eps,
-            "rope_base": self.rope_base,
-            "use_moe": self.use_moe,
-            "flash_attention": self.flash_attention,
-            "num_experts_per_token": self.num_experts_per_token,
-            "num_routed_experts": self.num_routed_experts,
-            "num_shared_experts": self.num_shared_experts,
-            "scoring_function": self.scoring_function,
-            "aux_loss_alpha": self.aux_loss_alpha,
-            "seq_aux": self.seq_aux,
-            "norm_topk_prob": self.norm_topk_prob,
-            "capacity_factor": self.capacity_factor,
-            "inference_rope_scaling": self.inference_rope_scaling,
-        }
+        return _lm_config_kwargs(self, INFER_LM_CONFIG_FIELDS)
 
     def to_vllm_kwargs(self) -> dict:
         kwargs = {
@@ -267,323 +449,3 @@ class InferConfig(BaseSettings):
         if self.vllm_max_num_seqs is not None:
             kwargs["max_num_seqs"] = self.vllm_max_num_seqs
         return kwargs
-
-
-class SFTConfig(BaseSettings):
-    """
-    Full SFT 配置：可从 .env、环境变量（SFT_*）、配置文件、命令行加载，后者覆盖前者。
-
-    使用方式：用 get_sft_config() 得到实例，例如：
-      cfg = get_sft_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="SFT_",
-        env_nested_delimiter="__",
-        extra="ignore",
-        str_strip_whitespace=True,
-    )
-
-    # ----- 保存与输出 -----
-    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
-    save_weight: str = Field("full_sft", description="保存权重文件名前缀")
-    save_interval: int = Field(1000, gt=0, description="每 N step 保存一次")
-    log_interval: int = Field(100, gt=0, description="每 N step 打一次日志")
-
-    # ----- 训练超参 -----
-    epochs: int = Field(1, ge=1, description="训练轮数")
-    batch_size: int = Field(8, gt=0, description="batch size")
-    learning_rate: float = Field(1e-6, gt=0.0, description="初始学习率")
-    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
-    grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
-
-    # ----- 设备与精度 -----
-    device: str = Field(default_factory=_default_device, description="训练设备，如 cuda:0 / cpu")
-    dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
-
-    # ----- 数据 -----
-    data_path: str = Field("./dataset/sft_512.jsonl", description="SFT 训练数据路径（jsonl）")
-    num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
-    max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
-
-    # ----- 分词器 -----
-    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
-
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
-    num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
-    use_moe: bool = Field(True, description="是否使用 MoE 架构")
-    attention_type: Literal["gqa", "mla"] = Field("gqa", description="注意力实现类型")
-    mla_q_lora_rank: int | None = Field(None, ge=0, description="MLA query 低秩投影 rank；None 表示按 hidden_size 自动推导，0 表示直接投影")
-    mla_kv_lora_rank: int | None = Field(None, gt=0, description="MLA latent KV rank；None 表示按 hidden_size 自动推导")
-    mla_qk_nope_head_dim: int | None = Field(None, ge=0, description="MLA 中不使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
-
-    # ----- 恢复与续训 -----
-    from_weight: str = Field("pretrain", description="从哪个权重继续训，none 表示从头")
-    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
-
-    # ----- 实验与工具 -----
-    use_swanlab: bool = Field(True, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-Full-SFT", description="swanlab 项目名")
-    use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
-
-    def to_lm_config_kwargs(self) -> dict:
-        """抽出模型结构相关字段，传给 MiniMindConfig。"""
-        return {
-            "hidden_size": self.hidden_size,
-            "num_hidden_layers": self.num_hidden_layers,
-            "use_moe": self.use_moe,
-            "attention_type": self.attention_type,
-            "mla_q_lora_rank": self.mla_q_lora_rank,
-            "mla_kv_lora_rank": self.mla_kv_lora_rank,
-            "mla_qk_nope_head_dim": self.mla_qk_nope_head_dim,
-            "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
-            "mla_v_head_dim": self.mla_v_head_dim,
-        }
-
-
-class DPOConfig(BaseSettings):
-    """
-    DPO (Direct Preference Optimization) 配置：可从 .env、环境变量（DPO_*）、配置文件、命令行加载，后者覆盖前者。
-
-    使用方式：用 get_dpo_config() 得到实例，例如：
-      cfg = get_dpo_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="DPO_",
-        env_nested_delimiter="__",
-        extra="ignore",
-        str_strip_whitespace=True,
-    )
-
-    # ----- 保存与输出 -----
-    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
-    save_weight: str = Field("dpo", description="保存权重文件名前缀")
-    save_interval: int = Field(100, gt=0, description="每 N step 保存一次")
-    log_interval: int = Field(100, gt=0, description="每 N step 打一次日志")
-
-    # ----- 训练超参 -----
-    epochs: int = Field(1, ge=1, description="训练轮数")
-    batch_size: int = Field(4, gt=0, description="batch size")
-    learning_rate: float = Field(4e-8, gt=0.0, description="初始学习率（建议<=5e-8 避免遗忘）")
-    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
-    grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
-
-    # ----- 设备与精度 -----
-    device: str = Field(default_factory=_default_device, description="训练设备，如 cuda:0 / cpu")
-    dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
-
-    # ----- 数据 -----
-    data_path: str = Field("./dataset/dpo.jsonl", description="DPO 训练数据路径（jsonl）")
-    num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
-    max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
-
-    # ----- 分词器 -----
-    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
-
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
-    num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
-    use_moe: bool = Field(False, description="是否使用 MoE 架构")
-    attention_type: Literal["gqa", "mla"] = Field("gqa", description="注意力实现类型")
-    mla_q_lora_rank: int | None = Field(None, ge=0, description="MLA query 低秩投影 rank；None 表示按 hidden_size 自动推导，0 表示直接投影")
-    mla_kv_lora_rank: int | None = Field(None, gt=0, description="MLA latent KV rank；None 表示按 hidden_size 自动推导")
-    mla_qk_nope_head_dim: int | None = Field(None, ge=0, description="MLA 中不使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
-
-    # ----- 恢复与续训 -----
-    from_weight: str = Field("full_sft", description="基于哪个权重训练")
-    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
-
-    # ----- DPO 专用 -----
-    beta: float = Field(0.1, gt=0.0, description="DPO 中的 beta 参数")
-
-    # ----- 实验与工具 -----
-    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-DPO", description="swanlab 项目名")
-    use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
-
-    def to_lm_config_kwargs(self) -> dict:
-        """抽出模型结构相关字段，传给 MiniMindConfig。"""
-        return {
-            "hidden_size": self.hidden_size,
-            "num_hidden_layers": self.num_hidden_layers,
-            "use_moe": self.use_moe,
-            "attention_type": self.attention_type,
-            "mla_q_lora_rank": self.mla_q_lora_rank,
-            "mla_kv_lora_rank": self.mla_kv_lora_rank,
-            "mla_qk_nope_head_dim": self.mla_qk_nope_head_dim,
-            "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
-            "mla_v_head_dim": self.mla_v_head_dim,
-        }
-
-
-class GRPOConfig(BaseSettings):
-    """
-    GRPO (Group Relative Policy Optimization) 配置：可从 .env、环境变量（GRPO_*）、配置文件、命令行加载，后者覆盖前者。
-
-    使用方式：用 get_grpo_config() 得到实例，例如：
-      cfg = get_grpo_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="GRPO_",
-        env_nested_delimiter="__",
-        extra="ignore",
-        str_strip_whitespace=True,
-    )
-
-    # ----- 保存与输出 -----
-    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
-    save_weight: str = Field("grpo", description="保存权重文件名前缀")
-    save_interval: int = Field(10, gt=0, description="每 N step 保存一次")
-    log_interval: int = Field(1, gt=0, description="每 N step 打一次日志")
-
-    # ----- 训练超参 -----
-    epochs: int = Field(1, ge=1, description="训练轮数")
-    batch_size: int = Field(2, gt=0, description="batch size")
-    learning_rate: float = Field(8e-8, gt=0.0, description="初始学习率")
-    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
-    grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
-
-    # ----- 设备与精度 -----
-    device: str = Field(default_factory=_default_device, description="训练设备，如 cuda:0 / cpu")
-    dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
-
-    # ----- 数据 -----
-    data_path: str = Field("./dataset/rlaif-mini.jsonl", description="RLAIF 训练数据路径（jsonl）")
-    num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
-    max_seq_len: int = Field(66, gt=0, description="Prompt 最大长度")
-    max_gen_len: int = Field(1536, gt=0, description="生成的最大长度")
-    num_generations: int = Field(8, gt=0, description="每个 prompt 生成的样本数")
-
-    # ----- 分词器 -----
-    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
-
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
-    num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
-    use_moe: bool = Field(False, description="是否使用 MoE 架构")
-    attention_type: Literal["gqa", "mla"] = Field("gqa", description="注意力实现类型")
-    mla_q_lora_rank: int | None = Field(None, ge=0, description="MLA query 低秩投影 rank；None 表示按 hidden_size 自动推导，0 表示直接投影")
-    mla_kv_lora_rank: int | None = Field(None, gt=0, description="MLA latent KV rank；None 表示按 hidden_size 自动推导")
-    mla_qk_nope_head_dim: int | None = Field(None, ge=0, description="MLA 中不使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
-
-    # ----- 恢复与续训 -----
-    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
-
-    # ----- GRPO 专用 -----
-    beta: float = Field(0.02, gt=0.0, description="KL 惩罚系数")
-    reasoning: int = Field(1, ge=0, le=1, description="推理模型类型（0=普通模型，1=推理模型）")
-    # reward_model_path: str = Field(
-    #     "../../internlm2-1_8b-reward",
-    #     description="Reward 模型路径",
-    # )
-    reward_model_name: str = Field("internlm/internlm2-1_8b-reward", description="Reward 模型名称")
-    reward_model_tokenizer_name: str = Field("internlm/internlm2-1_8b-reward", description="Reward 模型分词器名称")
-
-    # ----- 实验与工具 -----
-    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-GRPO", description="swanlab 项目名")
-    use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
-
-    def to_lm_config_kwargs(self) -> dict:
-        """抽出模型结构相关字段，传给 MiniMindConfig（供 policy / reference 模型使用）。"""
-        return {
-            "hidden_size": self.hidden_size,
-            "num_hidden_layers": self.num_hidden_layers,
-            "use_moe": self.use_moe,
-            "attention_type": self.attention_type,
-            "mla_q_lora_rank": self.mla_q_lora_rank,
-            "mla_kv_lora_rank": self.mla_kv_lora_rank,
-            "mla_qk_nope_head_dim": self.mla_qk_nope_head_dim,
-            "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
-            "mla_v_head_dim": self.mla_v_head_dim,
-            # GRPO 里 max_seq_len 通常为 prompt+生成的总长度
-            "max_seq_len": self.max_seq_len + self.max_gen_len,
-        }
-
-
-class DistillationConfig(BaseSettings):
-    """
-    On-policy 白盒蒸馏配置：可从 .env、环境变量（DISTILL_*）、配置文件、命令行加载，后者覆盖前者。
-
-    使用方式：用 get_distillation_config() 得到实例，例如：
-      cfg = get_distillation_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="DISTILL_",
-        env_nested_delimiter="__",
-        extra="ignore",
-        str_strip_whitespace=True,
-    )
-
-    # ----- 保存与输出 -----
-    save_dir: str = Field("./out", description="模型/checkpoint 保存目录")
-    save_weight: str = Field("distill", description="保存权重文件名前缀")
-    save_interval: int = Field(1000, gt=0, description="每 N step 保存一次")
-    log_interval: int = Field(100, gt=0, description="每 N step 打一次日志")
-
-    # ----- 训练超参 -----
-    epochs: int = Field(2, ge=1, description="训练轮数")
-    batch_size: int = Field(16, gt=0, description="batch size")
-    learning_rate: float = Field(1e-6, gt=0.0, description="初始学习率")
-    accumulation_steps: int = Field(1, ge=1, description="梯度累积步数")
-    grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
-
-    # ----- 设备与精度 -----
-    device: str = Field(default_factory=_default_device, description="训练设备，如 cuda:0 / cpu")
-    dtype: Literal["bfloat16", "float16"] = Field("bfloat16", description="混合精度类型")
-
-    # ----- 数据 -----
-    data_path: str = Field("./dataset/sft_mini_512.jsonl", description="蒸馏训练数据路径（jsonl）")
-    num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
-    max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
-
-    # ----- 分词器 -----
-    tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
-
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
-    num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
-    use_moe: bool = Field(False, description="是否使用 MoE 架构")
-    attention_type: Literal["gqa", "mla"] = Field("gqa", description="注意力实现类型")
-    mla_q_lora_rank: int | None = Field(None, ge=0, description="MLA query 低秩投影 rank；None 表示按 hidden_size 自动推导，0 表示直接投影")
-    mla_kv_lora_rank: int | None = Field(None, gt=0, description="MLA latent KV rank；None 表示按 hidden_size 自动推导")
-    mla_qk_nope_head_dim: int | None = Field(None, ge=0, description="MLA 中不使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
-    mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
-
-    # ----- 恢复与续训 -----
-    from_weight: str = Field("pretrain", description="基于哪个权重训练，none 表示从头")
-    from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
-
-    # ----- 实验与工具 -----
-    use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-Distillation", description="swanlab 项目名")
-    use_compile: bool = Field(False, description="是否使用 torch.compile 加速")
-
-    def to_lm_config_kwargs(self) -> dict:
-        """抽出模型结构相关字段，传给 MiniMindConfig。"""
-        return {
-            "hidden_size": self.hidden_size,
-            "num_hidden_layers": self.num_hidden_layers,
-            "use_moe": self.use_moe,
-            "attention_type": self.attention_type,
-            "mla_q_lora_rank": self.mla_q_lora_rank,
-            "mla_kv_lora_rank": self.mla_kv_lora_rank,
-            "mla_qk_nope_head_dim": self.mla_qk_nope_head_dim,
-            "mla_qk_rope_head_dim": self.mla_qk_rope_head_dim,
-            "mla_v_head_dim": self.mla_v_head_dim,
-        }

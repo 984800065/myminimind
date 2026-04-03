@@ -23,11 +23,11 @@ from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM as MiniMi
 from myminimind.utils.logger import logger
 from myminimind.utils.train_utils import (
     SkipBatchSampler,
-    get_model_weight_path,
     init_distributed,
     init_model,
     is_main_process,
     lm_checkpoint,
+    log_swanlab_training_metrics,
     resolve_lm_config_and_tokenizer,
     setup_seed,
 )
@@ -241,6 +241,8 @@ def grpo_train_epoch(
             avg_reward_val = rewards.mean().item()
             avg_len_val = completion_mask.sum(dim=1).float().mean().item()
             current_lr = optimizer.param_groups[0]["lr"]
+            spend_time = time.time() - start_time
+            eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
 
             # logger.info(
             #     f"Epoch:[{epoch + 1}/{cfg.epochs}]({step}/{iters}), "
@@ -255,43 +257,35 @@ def grpo_train_epoch(
                 learning_rate=current_lr,
             )
 
-            if swanlab_ and is_main_process():
-                swanlab_.log(
-                    {
-                        "policy_loss": policy_loss_val,
-                        "aux_loss": current_aux_loss,
-                        "reward": avg_reward_val,
-                        "avg_response_len": avg_len_val,
-                        "advantages_mean": advantages.mean().item(),
-                        "learning_rate": current_lr,
-                    }
-                )
+            log_swanlab_training_metrics(
+                swanlab_ if is_main_process() else None,
+                epoch=epoch,
+                step=step,
+                steps_per_epoch=total_iters,
+                total_epochs=cfg.epochs,
+                learning_rate=current_lr,
+                elapsed_seconds=spend_time,
+                eta_minutes=float(eta_min),
+                train_metrics={
+                    "policy_loss": policy_loss_val,
+                    "aux_loss": current_aux_loss,
+                    "reward": avg_reward_val,
+                    "avg_response_len (tokens)": avg_len_val,
+                    "advantages_mean": advantages.mean().item(),
+                },
+            )
 
         if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
-            ckp = get_model_weight_path(
-                save_dir=cfg.save_dir,
-                weight=cfg.save_weight,
-                hidden_size=lm_config.hidden_size,
-                use_moe=lm_config.use_moe,
-                attention_type=getattr(lm_config, "attention_type", "gqa"),
-            )
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, "_orig_mod", raw_model)
-            state_dict = raw_model.state_dict()
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(
-                lm_config=lm_config,
-                weight=cfg.save_weight,
+                cfg=cfg,
                 model=model,
                 optimizer=optimizer,
                 epoch=epoch,
                 step=step,
                 scheduler=scheduler,
-                save_dir=cfg.save_dir,
             )
             model.train()
-            del state_dict
 
         del prompt_inputs, outputs, completion_ids, per_token_logps, ref_per_token_logps
         del completions, rewards, grouped_rewards, inner_batch_mean_reward, inner_batch_std_reward, advantages, completion_mask
@@ -380,8 +374,8 @@ def main() -> None:
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg.to_lm_config_kwargs(), cfg.tokenizer_path)
-    ckp_data = lm_checkpoint(lm_config, weight=cfg.save_weight, save_dir=cfg.save_dir) if cfg.from_resume else None
+    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg)
+    ckp_data = lm_checkpoint(cfg) if cfg.from_resume else None
 
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in cfg.device else "cpu"
@@ -399,15 +393,13 @@ def main() -> None:
         swanlab_ = swanlab
 
     # ========== 5. 初始化模型、Reward 与数据 ==========
-    base_weight = "reason" if cfg.reasoning == 1 else "full_sft"
+    base_weight = cfg.from_weight if cfg.from_weight != "none" else ("reason" if cfg.reasoning == 1 else "full_sft")
     # Policy 模型
     model, tokenizer = init_model(
+        cfg=cfg,
         lm_config=lm_config,
-        from_weight=base_weight,
-        tokenizer_path=cfg.tokenizer_path,
-        save_dir=cfg.save_dir,
-        device=cfg.device,
         tokenizer=tokenizer,
+        from_weight=base_weight,
     )
     if cfg.use_compile:
         model = torch.compile(model)
@@ -415,12 +407,10 @@ def main() -> None:
 
     # Reference 模型
     ref_model, _ = init_model(
+        cfg=cfg,
         lm_config=lm_config,
-        from_weight=base_weight,
-        tokenizer_path=cfg.tokenizer_path,
-        save_dir=cfg.save_dir,
-        device=cfg.device,
         tokenizer=tokenizer,
+        from_weight=base_weight,
     )
     ref_model = ref_model.eval().requires_grad_(False)
 

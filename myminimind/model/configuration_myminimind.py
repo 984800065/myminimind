@@ -112,6 +112,9 @@ class MyMiniMindConfig(PretrainedConfig):
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
         capacity_factor: float = 1.5,
+
+        # MTP configurations
+        mtp_level: int = 0,
         **kwargs,
     ):
         experts_implementation = kwargs.pop("experts_implementation", "eager")
@@ -246,6 +249,9 @@ class MyMiniMindConfig(PretrainedConfig):
         self.seq_aux = seq_aux
         self.norm_topk_prob = norm_topk_prob
         self.capacity_factor = capacity_factor
+
+        # MTP configurations
+        self.mtp_level = mtp_level
 
 
 def load_myminimind_config(path: str | Path) -> MyMiniMindConfig:

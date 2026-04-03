@@ -33,23 +33,11 @@ def _parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 def _checkpoint_path(
     checkpoint: Path | None,
-    save_dir: str,
-    weight: str,
-    hidden_size: int,
-    use_moe: bool,
-    attention_type: str,
+    infer_cfg,
 ) -> Path:
     if checkpoint is not None:
         return checkpoint
-    return Path(
-        get_model_weight_path(
-            save_dir=save_dir,
-            weight=weight,
-            hidden_size=hidden_size,
-            use_moe=use_moe,
-            attention_type=attention_type,
-        )
-    )
+    return Path(get_model_weight_path(infer_cfg))
 
 
 def _resolve_model_config(infer_cfg, tokenizer) -> MyMiniMindConfig:
@@ -76,11 +64,7 @@ def main() -> None:
     infer_cfg = get_infer_config(infer_args)
     checkpoint_path = _checkpoint_path(
         checkpoint=export_args.checkpoint,
-        save_dir=infer_cfg.save_dir,
-        weight=infer_cfg.weight,
-        hidden_size=infer_cfg.hidden_size,
-        use_moe=infer_cfg.use_moe,
-        attention_type=infer_cfg.attention_type,
+        infer_cfg=infer_cfg,
     )
     if infer_cfg.hf_model_dir:
         raise ValueError("--hf-model-dir is for loading an exported HF model, not for exporting a raw .pth checkpoint.")
