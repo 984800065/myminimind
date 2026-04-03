@@ -949,7 +949,10 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = MyMiniMindModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
         self.mtp_level = config.mtp_level
+        self.mtp_lambda = config.mtp_lambda
+
         if self.mtp_level > 0 and not self.training:
             raise ValueError("MTP modules are only for training and should not be used during inference")
         self.post_init()
@@ -995,7 +998,7 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
         )
         if return_dict:
             assert isinstance(model_outputs, MyBaseModelOutputWithPast)
-            hidden_states = model_outputs.last_hidden_state
+            hidden_states = model_outputs.mtp_hidden_states
             aux_loss = model_outputs.aux_loss
             present_key_values = model_outputs.past_key_values
         else:
@@ -1009,7 +1012,7 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
             loss = torch.scalar_tensor(0.0, device=hidden_states.device)
             for mtp_step in range(self.mtp_level + 1):
                 # logits.shape == (batch_size, seq_len - mtp_step, vocab_size)
-                logits: torch.Tensor = self.lm_head(hidden_states[mtp_step, :, mtp_step:, :])
+                logits: torch.Tensor = self.lm_head(hidden_states[mtp_step][:, mtp_step:, :])
                 # shift_logits.shape == (batch_size, seq_len - mtp_step - 1, vocab_size)
                 shift_logits = logits[..., :-1, :].contiguous()
 
@@ -1018,6 +1021,8 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
                 shift_labels = labels[:, mtp_step + 1:].contiguous()
                 # label中句子完成之后的padding token的id被赋值成了-100，因此这些token不计入损失
                 loss = loss + F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+            
+            loss = self.mtp_lambda * loss / (self.mtp_level + 1)
 
             if not torch.isfinite(loss).all():
                 raise FloatingPointError(f"loss is not finite, shift_logits: {shift_logits}, shift_labels: {shift_labels}")

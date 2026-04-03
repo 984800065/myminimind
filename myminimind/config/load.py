@@ -109,6 +109,7 @@ def _add_multi_token_prediction_args(parser: argparse.ArgumentParser) -> None:
         choices=[0, 1, 2],
         help="多token预测数量（0=无多token预测，1=多预测1个token，2=多预测2个token，......）",
     )
+    parser.add_argument("--mtp-lambda", type=float, default=None, dest="mtp_lambda", help="多token预测损失权重")
 
 
 def _add_train_model_parser_args(parser: argparse.ArgumentParser, *, include_mtp: bool = False) -> None:

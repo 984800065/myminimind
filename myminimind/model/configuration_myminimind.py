@@ -115,6 +115,7 @@ class MyMiniMindConfig(PretrainedConfig):
 
         # MTP configurations
         mtp_level: int = 0,
+        mtp_lambda: float = 1.0,
         **kwargs,
     ):
         experts_implementation = kwargs.pop("experts_implementation", "eager")
@@ -252,6 +253,7 @@ class MyMiniMindConfig(PretrainedConfig):
 
         # MTP configurations
         self.mtp_level = mtp_level
+        self.mtp_lambda = mtp_lambda
 
 
 def load_myminimind_config(path: str | Path) -> MyMiniMindConfig:

@@ -36,6 +36,7 @@ TRAIN_LM_CONFIG_FIELDS = (
     "mla_qk_rope_head_dim",
     "mla_v_head_dim",
     "mtp_level",
+    "mtp_lambda",
 )
 
 INFER_LM_CONFIG_FIELDS = (
@@ -67,6 +68,7 @@ INFER_LM_CONFIG_FIELDS = (
     "capacity_factor",
     "inference_rope_scaling",
     "mtp_level",
+    "mtp_lambda",
 )
 
 
@@ -119,7 +121,7 @@ class TrainConfig(BaseConfig):
     # ----- 训练超参 -----
     epochs: int = Field(description="训练轮数")
 
-    batch_size: int = Field(8, gt=0, description="batch size")
+    batch_size: int = Field(4, gt=0, description="batch size")
     learning_rate: float = Field(5e-4, gt=0.0, description="初始学习率")
     accumulation_steps: int = Field(4, ge=1, description="梯度累积步数")
     grad_clip: float = Field(1.0, ge=0.0, description="梯度裁剪阈值")
@@ -143,7 +145,9 @@ class TrainConfig(BaseConfig):
     mla_qk_nope_head_dim: int | None = Field(None, ge=0, description="MLA 中不使用 RoPE 的 Q/K head 维度；None 表示自动推导")
     mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
     mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
+
     mtp_level: int = Field(0, ge=0, le=2, description="多token预测数量（0=无多token预测，1=多预测1个token，2=多预测2个token，......）")
+    mtp_lambda: float = Field(1.0, ge=0.0, description="多token预测损失权重")
 
     # ----- 实验与工具 -----
     swanlab_project: str = Field(description="swanlab 项目名")

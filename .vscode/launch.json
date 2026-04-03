@@ -1,0 +1,41 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Pretrain (Single Process)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "module": "myminimind.training.train_pretrain",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "7",
+                "HF_ENDPOINT": "https://hf-mirror.com"
+            },
+            "args": [
+                "--data-path",
+                "dataset/pretrain_hq_test.jsonl",
+                "--save-weight",
+                "pretrain_hq_test",
+                "--mtp-level",
+                "1",
+                "--use-swanlab",
+                "false",
+                "--debug",
+                "true"
+            ]
+        }
+    ]
+}
