@@ -280,7 +280,7 @@ def main():
     ref_model.requires_grad_(False)
     logger.info(f"参考模型总参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M")
 
-    train_dataset = DPODataset(cfg.data_path, tokenizer, max_length=cfg.max_seq_len)
+    train_dataset = DPODataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler(enabled=(cfg.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)

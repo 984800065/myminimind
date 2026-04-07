@@ -1,50 +1,8 @@
 import json
-from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from transformers import PretrainedConfig
-
-
-def _normalize_rope_scaling(
-    rope_scaling: dict[str, Any] | None,
-    rope_parameters: dict[str, Any] | None,
-    rope_params: dict[str, Any] | None,
-    *,
-    original_max_position_embeddings: int,
-) -> dict[str, Any]:
-    """Normalize legacy RoPE payloads to the standard HF `rope_scaling` shape."""
-    if rope_scaling is not None:
-        normalized = deepcopy(rope_scaling)
-    elif rope_parameters is not None:
-        normalized = deepcopy(rope_parameters)
-    elif rope_params is not None:
-        normalized = deepcopy(rope_params)
-    else:
-        normalized = {}
-
-    interpolation_type = normalized.pop("interpolation_type", None)
-    if interpolation_type is not None and "rope_type" not in normalized:
-        normalized["rope_type"] = interpolation_type
-
-    train_seq_len = normalized.pop("train_seq_len", None)
-    if train_seq_len is not None and "original_max_position_embeddings" not in normalized:
-        normalized["original_max_position_embeddings"] = train_seq_len
-
-    if "type" in normalized and "rope_type" not in normalized:
-        normalized["rope_type"] = normalized.pop("type")
-
-    normalized.pop("rope_theta", None)
-    normalized.setdefault("rope_type", "yarn")
-    normalized.setdefault("factor", 16.0)
-    normalized.setdefault("beta_fast", 32.0)
-    normalized.setdefault("beta_slow", 1.0)
-    normalized.setdefault("original_max_position_embeddings", original_max_position_embeddings)
-    normalized.setdefault("attention_factor", 1.0)
-    for key in ("factor", "beta_fast", "beta_slow", "attention_factor"):
-        if normalized.get(key) is not None:
-            normalized[key] = float(normalized[key])
-    return normalized
 
 
 class MyMiniMindConfig(PretrainedConfig):
@@ -98,7 +56,18 @@ class MyMiniMindConfig(PretrainedConfig):
         scale_fmt: str | None = None,
         vocab_size: int = 6400,
         rms_norm_eps: float = 1e-5,
-        rope_base: int = 1_000_000,
+        norm_implementation: str = "rms_liger",
+        rope_implementation: str = "eager",
+        rope_theta: int = 1_000_000,
+        # Hugging Face style RoPE scaling payload.
+        # Common keys:
+        # - rope_type: e.g. "default", "yarn", ...
+        # - factor
+        # - beta_fast
+        # - beta_slow
+        # - original_max_position_embeddings
+        # - attention_factor
+        rope_scaling: dict[str, Any] | None = None,
         original_max_position_embeddings: int | None = None,
         inference_rope_scaling: bool = False,
         flash_attention: bool = True,
@@ -119,12 +88,6 @@ class MyMiniMindConfig(PretrainedConfig):
         **kwargs,
     ):
         experts_implementation = kwargs.pop("experts_implementation", "eager")
-        rope_scaling = _normalize_rope_scaling(
-            rope_scaling=kwargs.pop("rope_scaling", None),
-            rope_parameters=kwargs.pop("rope_parameters", None),
-            rope_params=kwargs.pop("rope_params", None),
-            original_max_position_embeddings=original_max_position_embeddings or max_seq_len,
-        )
         super().__init__(
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
@@ -151,8 +114,16 @@ class MyMiniMindConfig(PretrainedConfig):
 
         self.max_seq_len = max_seq_len
 
-        # RMSNorm configurations
+        # Norm configuration.
+        # The actual module is chosen later by `build_norm(...)`.
         self.rms_norm_eps = rms_norm_eps
+        self.norm_implementation = norm_implementation
+
+        # RoPE implementation configuration.
+        # `RotaryEmbedding` itself stays common for all implementations.
+        # This flag is used to choose how q/k rotary application is done later
+        # in `build_apply_rotary_pos_emb(...)`.
+        self.rope_implementation = rope_implementation
 
         # Group Query Attention configurations
         self.num_attention_heads = num_attention_heads
@@ -231,11 +202,15 @@ class MyMiniMindConfig(PretrainedConfig):
         self.scale_fmt = scale_fmt
 
         # RoPE configurations
-        self.rope_base = rope_base
-        self.rope_theta = rope_base
+        self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
         self.max_position_embeddings = max_seq_len
+        if original_max_position_embeddings is None and rope_scaling is not None:
+            original_max_position_embeddings = rope_scaling.get("original_max_position_embeddings")
         self.original_max_position_embeddings = original_max_position_embeddings or max_seq_len
+        # Only store the Hugging Face style `rope_scaling` payload here.
+        # The model code currently reads `rope_type` and `attention_factor`.
+        # Other keys are kept on config for future RoPE variants.
         self.rope_scaling = rope_scaling
 
         self.flash_attention = flash_attention

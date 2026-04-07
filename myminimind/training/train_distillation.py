@@ -206,7 +206,7 @@ def main():
         model = torch.compile(model)
         logger.info("torch.compile enabled")
 
-    train_dataset = SFTDataset(cfg.data_path, tokenizer, max_length=cfg.max_seq_len)
+    train_dataset = SFTDataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler(enabled=(cfg.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)

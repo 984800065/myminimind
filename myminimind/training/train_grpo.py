@@ -144,10 +144,10 @@ def grpo_train_epoch(
         prompts: list[str] = batch["prompt"]
         prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False, padding_side="left", add_special_tokens=False).to(cfg.device)
 
-        if cfg.max_seq_len:
-            # (batch_size, max_seq_len)
-            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -cfg.max_seq_len :]
-            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -cfg.max_seq_len :]
+        if cfg.data_max_seq_len:
+            # (batch_size, data_max_seq_len)
+            prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -cfg.data_max_seq_len :]
+            prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -cfg.data_max_seq_len :]
 
         with torch.no_grad():
             model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
@@ -426,7 +426,7 @@ def main() -> None:
     reward_tokenizer = AutoTokenizer.from_pretrained(cfg.reward_model_tokenizer_name, trust_remote_code=True)
 
     # 数据与优化器
-    train_dataset = RLAIFDataset(cfg.data_path, tokenizer, max_length=lm_config.max_seq_len)
+    train_dataset = RLAIFDataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     loader_for_count = DataLoader(train_dataset, batch_size=cfg.batch_size, sampler=train_sampler)

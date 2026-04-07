@@ -14,26 +14,10 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs
 
 from .configuration_myminimind import MyMiniMindConfig
+from .norms import LayerNorm, RMSNorm, build_norm
+from .ropes import ApplyRotaryPosEmbFn, RotaryEmbedding, apply_rotary_pos_emb_interleave, build_apply_rotary_pos_emb
 
 SUPPORTED_EXPERTS_IMPLEMENTATIONS = {"eager", "grouped_mm", "batched_mm"}
-
-
-def apply_rotary_pos_emb_interleave(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, position_ids: int | None = None, unsqueeze_dim: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
-    # cos.shape == (batch_size, 1, seq_len, head_dim)
-    cos = cos.unsqueeze(unsqueeze_dim)
-    # sin.shape == (batch_size, 1, seq_len, head_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    # q.shape == (batch_size, num_query_heads, seq_len, head_dim)
-    # k.shape == (batch_size, num_key_value_heads, seq_len, head_dim)
-
-    def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-        # x.shape == (batch_size, num_heads, seq_len, head_dim)
-        return torch.cat([-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]], dim=-1)
-
-    q_embed = q * cos + _rotate_half(q) * sin
-    k_embed = k * cos + _rotate_half(k) * sin
-    return q_embed, k_embed
 
 
 def myminimind_gqa_eager_attention_forward(
@@ -119,90 +103,6 @@ class MyCausalLMOutputWithPast(CausalLMOutputWithPast):
         self.aux_loss = aux_loss
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def _rms(self, x: torch.Tensor) -> torch.Tensor:
-        x_fp32 = x.float()
-        rms = torch.sqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps).type_as(x_fp32)
-        return rms.to(x.dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x / self._rms(x) * self.weight.to(x.dtype)
-
-
-class RotaryEmbedding(nn.Module):
-    inv_freq: torch.Tensor
-
-    def __init__(self, config: MyMiniMindConfig, device=None):
-        super().__init__()
-        self.max_seq_len_cached = config.max_seq_len
-        self.original_max_seq_len = config.max_seq_len
-
-        self.config = config
-
-        rope_scaling = getattr(self.config, "rope_scaling", None) or {}
-        self.rope_type = rope_scaling.get("rope_type", "default")
-        rope_init_fn = self.compute_default_rope_parameters
-
-        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
-
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
-
-    @staticmethod
-    def compute_default_rope_parameters(
-        config: MyMiniMindConfig,
-        device: torch.device | None = None,
-        seq_len: int | None = None,
-    ) -> tuple[torch.Tensor, float]:
-        rope_scaling = getattr(config, "rope_scaling", None) or {}
-        base = config.rope_theta
-
-        # adjust for multihead attention
-        assert config.hidden_size % config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
-        dim = (
-            config.mla_qk_rope_head_dim
-            if getattr(config, "attention_type", "gqa") == "mla"
-            else config.hidden_size // config.num_attention_heads
-        )
-
-        attention_factor = float(rope_scaling.get("attention_factor", 1.0))
-
-        # inv_freq.shape == (dim // 2)
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
-        return inv_freq, attention_factor
-
-    comput_default_rope_parameters = compute_default_rope_parameters
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
-        # inv_freq_expanded.shape == (batch_size, dim // 2, 1)
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
-
-        # position_ids.shape == (batch_size, seq_len)
-        # position_ids_expanded.shape ==(batch_size, 1, seq_len)
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type
-        # Force float32
-        with torch.autocast(device_type=device_type, enabled=False):
-            # freqs.shape == (batch_size, dim // 2, seq_len)
-            freqs = torch.einsum("bdi,bis->bds", inv_freq_expanded, position_ids_expanded)
-            # freqs.shape == (batch_size, seq_len, dim // 2)
-            freqs = freqs.transpose(1, 2)
-            emb = torch.cat([freqs, freqs], dim=-1)
-            # cos.shape == (batch_size, seq_len, head_dim)
-            cos = emb.cos() * self.attention_scaling
-            # sin.shape == (batch_size, seq_len, head_dim)
-            sin = emb.sin() * self.attention_scaling
-
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-
 class GroupQueryAttention(nn.Module):
     def __init__(
         self,
@@ -233,6 +133,7 @@ class GroupQueryAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         self.is_flash_attention = config.flash_attention
+        self.apply_rotary_pos_emb: ApplyRotaryPosEmbFn = build_apply_rotary_pos_emb(config)
 
     def forward(
         self,
@@ -267,7 +168,7 @@ class GroupQueryAttention(nn.Module):
         cos, sin = position_embeddings
         # q.shape == (batch_size, num_heads, seq_len, head_dim)
         # k.shape == (batch_size, num_key_value_heads, seq_len, head_dim)
-        q, k = apply_rotary_pos_emb_interleave(q, k, cos=cos, sin=sin, position_ids=None, unsqueeze_dim=1)
+        q, k = self.apply_rotary_pos_emb(q, k, cos=cos, sin=sin, position_ids=None, unsqueeze_dim=1)
 
         if past_key_values is not None:
             k, v = past_key_values.update(k, v, self.layer_idx)
@@ -324,7 +225,7 @@ class MyMLA(nn.Module):
 
         if self.q_lora_rank > 0:
             self.wq_a = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-            self.q_norm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_norm = build_norm(config, hidden_size=self.q_lora_rank, eps=config.rms_norm_eps)
             self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.qk_head_dim, bias=False)
             self.q_proj = None
         else:
@@ -334,7 +235,7 @@ class MyMLA(nn.Module):
             self.wq_b = None
 
         self.wkv_a = nn.Linear(self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False)
-        self.kv_norm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_norm = build_norm(config, hidden_size=self.kv_lora_rank, eps=config.rms_norm_eps)
         self.wkv_b = nn.Linear(self.kv_lora_rank, self.n_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False)
 
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.hidden_size, bias=False)
@@ -343,6 +244,7 @@ class MyMLA(nn.Module):
         self.scale_fmt = config.scale_fmt
 
         self.dequant_wkv_b = None
+        self.apply_rotary_pos_emb: ApplyRotaryPosEmbFn = build_apply_rotary_pos_emb(config)
 
     def _project_query(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.q_proj is not None:
@@ -384,7 +286,7 @@ class MyMLA(nn.Module):
         cos, sin = position_embeddings
         # q_pe.shape == (batch_size, num_heads, seq_len, qk_rope_head_dim)
         # k_pe.shape == (batch_size, 1, seq_len, qk_rope_head_dim)
-        q_pe, k_pe = apply_rotary_pos_emb_interleave(q_pe, k_pe.unsqueeze(1), cos, sin, position_ids=None, unsqueeze_dim=1)
+        q_pe, k_pe = self.apply_rotary_pos_emb(q_pe, k_pe.unsqueeze(1), cos, sin, position_ids=None, unsqueeze_dim=1)
         # k_pe.shape == (batch_size, seq_len, qk_rope_head_dim)
         k_pe = k_pe.squeeze(1)
 
@@ -697,8 +599,8 @@ class MyMiniMindDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.mlp = FeedForward(config) if not config.use_moe else MoEFeedForward(config)
 
-        self.input_layernorm = RMSNorm(config.hidden_size)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size)
+        self.input_layernorm = build_norm(config, hidden_size=config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = build_norm(config, hidden_size=config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor | None = None, position_ids: torch.LongTensor | None = None, past_key_values: Cache | None = None, use_cache: bool | None = False, position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None, **kwargs
@@ -728,11 +630,9 @@ class MyMiniMindMTPModule(nn.Module):
         self.layer_idx = max_main_model_layer_idx + mtp_module_idx
 
         self.embed_dropout = nn.Dropout(config.dropout)
-        self.mtp_layernorm = RMSNorm(config.hidden_size * 2, eps=config.rms_norm_eps)
+        self.mtp_layernorm = build_norm(config, hidden_size=config.hidden_size * 2, eps=config.rms_norm_eps)
         self.linear_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.decoder_layer = MyMiniMindDecoderLayer(config, layer_idx=self.layer_idx)
-
-        self.rotary_emb = RotaryEmbedding(config=config)
     
     def forward(
         self, 
@@ -810,10 +710,10 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
         self.dropout = nn.Dropout(config.dropout)
 
         self.layers = nn.ModuleList([MyMiniMindDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.rotary_emb = RotaryEmbedding(config=config)
+        self.norm = build_norm(config, hidden_size=config.hidden_size, eps=config.rms_norm_eps)
 
-        assert config.hidden_size % config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads"
+        dim = self._get_rope_dim()
+        self.rotary_emb = RotaryEmbedding(config=config, dim=dim)
 
         self.mtp_level = config.mtp_level
         if self.mtp_level > 0 and not self.training:
@@ -827,6 +727,15 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
 
     def set_input_embeddings(self, value: nn.Embedding) -> None:
         self.embed_tokens = value
+
+    def _get_rope_dim(self) -> int:
+        if self.config.attention_type == "mla":
+            return self.config.mla_qk_rope_head_dim
+        elif self.config.attention_type == "gqa":
+            assert self.config.hidden_size % self.config.num_attention_heads == 0, "hidden_size must be divisible by num_attention_heads for GQA attention"
+            return self.config.hidden_size // self.config.num_attention_heads
+        else:
+            raise ValueError(f"Unsupported attention_type={self.config.attention_type!r} for determining rope dim.")
 
     def forward(
         self,
@@ -1053,6 +962,7 @@ __all__ = [
     "FeedForward",
     "GLU_FFN",
     "GroupQueryAttention",
+    "LayerNorm",
     "MoEFeedForward",
     "MoEGate",
     "MyBaseModelOutputWithPast",
@@ -1065,5 +975,7 @@ __all__ = [
     "RMSNorm",
     "RotaryEmbedding",
     "apply_rotary_pos_emb_interleave",
+    "build_norm",
+    "build_apply_rotary_pos_emb",
     "register_myminimind_for_auto_class",
 ]

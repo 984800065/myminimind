@@ -11,7 +11,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+import inspect
+from functools import lru_cache
+from typing import Any, Literal
 
 import torch
 from pydantic import Field
@@ -25,53 +27,6 @@ def _default_device() -> str:
 
 DEFAULT_TOKENIZER_PATH = "Qwen/Qwen3.5-0.8B"
 
-TRAIN_LM_CONFIG_FIELDS = (
-    "hidden_size",
-    "num_hidden_layers",
-    "use_moe",
-    "attention_type",
-    "mla_q_lora_rank",
-    "mla_kv_lora_rank",
-    "mla_qk_nope_head_dim",
-    "mla_qk_rope_head_dim",
-    "mla_v_head_dim",
-    "mtp_level",
-    "mtp_lambda",
-)
-
-INFER_LM_CONFIG_FIELDS = (
-    "hidden_act",
-    "hidden_size",
-    "intermediate_size",
-    "max_seq_len",
-    "num_attention_heads",
-    "num_hidden_layers",
-    "group_num",
-    "attention_type",
-    "mla_q_lora_rank",
-    "mla_kv_lora_rank",
-    "mla_qk_nope_head_dim",
-    "mla_qk_rope_head_dim",
-    "mla_v_head_dim",
-    "vocab_size",
-    "rms_norm_eps",
-    "rope_base",
-    "use_moe",
-    "flash_attention",
-    "num_experts_per_token",
-    "num_routed_experts",
-    "num_shared_experts",
-    "scoring_function",
-    "aux_loss_alpha",
-    "seq_aux",
-    "norm_topk_prob",
-    "capacity_factor",
-    "inference_rope_scaling",
-    "mtp_level",
-    "mtp_lambda",
-)
-
-
 def _settings_config(env_prefix: str) -> SettingsConfigDict:
     return SettingsConfigDict(
         env_prefix=env_prefix,
@@ -81,10 +36,49 @@ def _settings_config(env_prefix: str) -> SettingsConfigDict:
     )
 
 
-def _lm_config_kwargs(config: object, field_names: tuple[str, ...], **extra) -> dict:
-    kwargs = {name: getattr(config, name) for name in field_names}
+@lru_cache(maxsize=1)
+def _model_config_field_names() -> tuple[str, ...]:
+    """Use `MyMiniMindConfig` as the single source of truth for model fields."""
+    from myminimind.model.configuration_myminimind import MyMiniMindConfig
+
+    signature = inspect.signature(MyMiniMindConfig.__init__)
+    return tuple(name for name in signature.parameters if name not in {"self", "kwargs"})
+
+
+def _lm_config_kwargs(config: object, **extra) -> dict:
+    """Collect fields that both the runtime config and `MyMiniMindConfig` define."""
+    kwargs = {
+        name: getattr(config, name)
+        for name in _model_config_field_names()
+        if hasattr(config, name)
+    }
     kwargs.update(extra)
     return kwargs
+
+
+def _build_rope_scaling(config) -> dict[str, Any] | None:
+    """
+    训练/推理配置里把 RoPE scaling 暴露成扁平字段，这里统一组装成 HF 风格的 `rope_scaling` 字典。
+
+    这样命令行可以直接写 `--rope-type yarn --rope-factor 4.0`，
+    但模型配置里仍然保持标准的 `rope_scaling={"rope_type": ..., "factor": ...}` 结构。
+    """
+    rope_scaling: dict[str, Any] = {}
+
+    if getattr(config, "rope_type", None) is not None:
+        rope_scaling["rope_type"] = config.rope_type
+    if getattr(config, "rope_factor", None) is not None:
+        rope_scaling["factor"] = config.rope_factor
+    if getattr(config, "rope_beta_fast", None) is not None:
+        rope_scaling["beta_fast"] = config.rope_beta_fast
+    if getattr(config, "rope_beta_slow", None) is not None:
+        rope_scaling["beta_slow"] = config.rope_beta_slow
+    if getattr(config, "rope_original_max_position_embeddings", None) is not None:
+        rope_scaling["original_max_position_embeddings"] = config.rope_original_max_position_embeddings
+    if getattr(config, "rope_attention_factor", None) is not None:
+        rope_scaling["attention_factor"] = config.rope_attention_factor
+
+    return rope_scaling or None
 
 
 class BaseConfig(BaseSettings):
@@ -130,7 +124,7 @@ class TrainConfig(BaseConfig):
     data_path: str = Field(description="预训练数据路径（jsonl）")
 
     num_workers: int = Field(8, ge=0, description="DataLoader 线程数")
-    max_seq_len: int = Field(1024, gt=0, description="训练时最大截断长度（token）")
+    data_max_seq_len: int = Field(1024, gt=0, description="训练数据截断长度（token）；会同步为训练时的模型上下文长度")
 
     # ----- 分词器 -----
     tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
@@ -145,6 +139,28 @@ class TrainConfig(BaseConfig):
     mla_qk_nope_head_dim: int | None = Field(None, ge=0, description="MLA 中不使用 RoPE 的 Q/K head 维度；None 表示自动推导")
     mla_qk_rope_head_dim: int | None = Field(None, gt=0, description="MLA 中使用 RoPE 的 Q/K head 维度；None 表示自动推导")
     mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
+    norm_implementation: str = Field(
+        "rms_liger",
+        description="Norm 实现名称；当前内置支持: layer_eager / rms_eager / rms_liger，可继续扩展",
+    )
+    rope_implementation: str = Field(
+        "eager",
+        description="RoPE 实现名称；当前内置支持: eager / liger，可继续扩展",
+    )
+    rope_type: str | None = Field("default", description="RoPE scaling 类型；会写入 rope_scaling['rope_type']")
+    rope_factor: float | None = Field(16, gt=0.0, description="RoPE scaling 因子；会写入 rope_scaling['factor']")
+    rope_beta_fast: float | None = Field(32, gt=0.0, description="YaRN 的 beta_fast；会写入 rope_scaling['beta_fast']")
+    rope_beta_slow: float | None = Field(1, gt=0.0, description="YaRN 的 beta_slow；会写入 rope_scaling['beta_slow']")
+    rope_original_max_position_embeddings: int | None = Field(
+        512,
+        gt=0,
+        description="RoPE 原始训练上下文长度；会写入 rope_scaling['original_max_position_embeddings']",
+    )
+    rope_attention_factor: float | None = Field(
+        1.0,
+        gt=0.0,
+        description="RoPE attention factor；会写入 rope_scaling['attention_factor']",
+    )
 
     mtp_level: int = Field(0, ge=0, le=2, description="多token预测数量（0=无多token预测，1=多预测1个token，2=多预测2个token，......）")
     mtp_lambda: float = Field(1.0, ge=0.0, description="多token预测损失权重")
@@ -167,12 +183,16 @@ class TrainConfig(BaseConfig):
 
     def to_lm_config_kwargs(self) -> dict:
         """
-        只抽出「模型结构」相关字段，方便直接传给 MiniMindConfig。
+        从当前训练配置中自动抽出模型字段，并显式同步 `max_seq_len`。
 
         用法：lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
-        这样训练配置和模型配置解耦，PretrainConfig 管训练，MiniMindConfig 管模型结构。
+        训练侧把 `data_max_seq_len` 视为数据截断长度，同时也把它作为训练时模型上下文长度传给 `MiniMindConfig`。
         """
-        return _lm_config_kwargs(self, TRAIN_LM_CONFIG_FIELDS)
+        return _lm_config_kwargs(
+            self,
+            max_seq_len=self.data_max_seq_len,
+            rope_scaling=_build_rope_scaling(self),
+        )
 
 
 class PretrainConfig(TrainConfig):
@@ -297,7 +317,7 @@ class GRPOConfig(TrainConfig):
 
     # ----- 数据 -----
     data_path: str = Field("./dataset/rlaif-mini.jsonl", description="RLAIF 训练数据路径（jsonl）")
-    max_seq_len: int = Field(66, gt=0, description="Prompt 最大长度")
+    data_max_seq_len: int = Field(66, gt=0, description="Prompt 最大长度")
     max_gen_len: int = Field(1536, gt=0, description="生成的最大长度")
     num_generations: int = Field(8, gt=0, description="每个 prompt 生成的样本数")
 
@@ -323,11 +343,11 @@ class GRPOConfig(TrainConfig):
     swanlab_project: str = Field("MiniMind-GRPO", description="swanlab 项目名")
 
     def to_lm_config_kwargs(self) -> dict:
-        """抽出模型结构相关字段，传给 MiniMindConfig（供 policy / reference 模型使用）。"""
+        """构建 policy / reference 模型配置，并把上下文长度设为 prompt + generation。"""
         return _lm_config_kwargs(
             self,
-            TRAIN_LM_CONFIG_FIELDS,
-            max_seq_len=self.max_seq_len + self.max_gen_len,
+            max_seq_len=self.data_max_seq_len + self.max_gen_len,
+            rope_scaling=_build_rope_scaling(self),
         )
 
 
@@ -352,7 +372,7 @@ class DistillationConfig(TrainConfig):
 
     # ----- 数据 -----
     data_path: str = Field("./dataset/sft_mini_512.jsonl", description="蒸馏训练数据路径（jsonl）")
-    max_seq_len: int = Field(340, gt=0, description="训练时最大截断长度（token）")
+    data_max_seq_len: int = Field(340, gt=0, description="训练数据截断长度（token）")
 
     # ----- 模型结构（与 MiniMindConfig 对齐） -----
     hidden_size: int = Field(512, gt=0, description="隐藏层维度")
@@ -400,7 +420,29 @@ class InferConfig(BaseSettings):
     mla_v_head_dim: int | None = Field(None, gt=0, description="MLA value head 维度；None 表示等于常规 head_dim")
     vocab_size: int = Field(6400, gt=0, description="词表大小")
     rms_norm_eps: float = Field(1e-5, gt=0.0, description="RMSNorm epsilon")
-    rope_base: int = Field(1_000_000, gt=0, description="RoPE theta/base")
+    norm_implementation: str = Field(
+        "rms_liger",
+        description="Norm 实现名称；当前内置支持: layer_eager / rms_eager / rms_liger，可继续扩展",
+    )
+    rope_implementation: str = Field(
+        "eager",
+        description="RoPE 实现名称；当前内置支持: eager / liger，可继续扩展",
+    )
+    rope_theta: int = Field(1_000_000, gt=0, description="RoPE theta/base")
+    rope_type: str | None = Field("default", description="RoPE scaling 类型；会写入 rope_scaling['rope_type']")
+    rope_factor: float | None = Field(16, gt=0.0, description="RoPE scaling 因子；会写入 rope_scaling['factor']")
+    rope_beta_fast: float | None = Field(32, gt=0.0, description="YaRN 的 beta_fast；会写入 rope_scaling['beta_fast']")
+    rope_beta_slow: float | None = Field(1, gt=0.0, description="YaRN 的 beta_slow；会写入 rope_scaling['beta_slow']")
+    rope_original_max_position_embeddings: int | None = Field(
+        512,
+        gt=0,
+        description="RoPE 原始训练上下文长度；会写入 rope_scaling['original_max_position_embeddings']",
+    )
+    rope_attention_factor: float | None = Field(
+        1.0,
+        gt=0.0,
+        description="RoPE attention factor；会写入 rope_scaling['attention_factor']",
+    )
     use_moe: bool = Field(True, description="是否使用MoE架构")
     flash_attention: bool = Field(True, description="是否优先使用 flash attention 路径")
     num_experts_per_token: int = Field(2, gt=0, description="每个 token 选择的专家数")
@@ -411,6 +453,8 @@ class InferConfig(BaseSettings):
     seq_aux: bool = Field(True, description="是否使用 sequence-level auxiliary loss")
     norm_topk_prob: bool = Field(True, description="是否归一化 top-k expert 权重")
     capacity_factor: float = Field(1.5, gt=0.0, description="MoE expert capacity factor")
+    mtp_level: int = Field(0, ge=0, le=2, description="多token预测数量（主要用于权重结构对齐）")
+    mtp_lambda: float = Field(1.0, ge=0.0, description="多token预测损失权重（主要用于权重结构对齐）")
 
     # ----- 推理与生成 -----
     inference_rope_scaling: bool = Field(False, description="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
@@ -435,8 +479,8 @@ class InferConfig(BaseSettings):
     device: str = Field(default_factory=_default_device, description="运行设备")
 
     def to_lm_config_kwargs(self) -> dict:
-        """抽出模型结构相关字段，传给 MiniMindConfig。"""
-        return _lm_config_kwargs(self, INFER_LM_CONFIG_FIELDS)
+        """抽出当前推理配置中与 `MyMiniMindConfig` 同名的字段。"""
+        return _lm_config_kwargs(self, rope_scaling=_build_rope_scaling(self))
 
     def to_vllm_kwargs(self) -> dict:
         kwargs = {

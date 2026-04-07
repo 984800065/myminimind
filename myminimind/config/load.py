@@ -78,10 +78,10 @@ def _add_device_dtype_parser_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_basic_data_parser_args(parser: argparse.ArgumentParser) -> None:
-    """注册数据路径、DataLoader 线程数和序列长度参数。"""
+    """注册数据路径、DataLoader 线程数和训练数据截断长度参数。"""
     parser.add_argument("--data-path", type=str, default=None, dest="data_path")
     parser.add_argument("--num-workers", type=int, default=None, dest="num_workers")
-    parser.add_argument("--max-seq-len", type=int, default=None, dest="max_seq_len")
+    parser.add_argument("--data-max-seq-len", "--max-seq-len", type=int, default=None, dest="data_max_seq_len")
 
 
 def _add_tokenizer_parser_args(parser: argparse.ArgumentParser) -> None:
@@ -97,6 +97,27 @@ def _add_attention_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mla-qk-nope-head-dim", type=int, default=None, dest="mla_qk_nope_head_dim")
     parser.add_argument("--mla-qk-rope-head-dim", type=int, default=None, dest="mla_qk_rope_head_dim")
     parser.add_argument("--mla-v-head-dim", type=int, default=None, dest="mla_v_head_dim")
+
+
+def _add_norm_parser_args(parser: argparse.ArgumentParser) -> None:
+    """给命令行解析器补充 norm 实现选择参数。"""
+    parser.add_argument("--norm-implementation", type=str, default=None, dest="norm_implementation")
+
+
+def _add_rope_parser_args(parser: argparse.ArgumentParser) -> None:
+    """给命令行解析器补充扁平的 RoPE scaling 参数，随后由 schema 组装为 `rope_scaling` 字典。"""
+    parser.add_argument("--rope-implementation", type=str, default=None, dest="rope_implementation")
+    parser.add_argument("--rope-type", type=str, default=None, dest="rope_type")
+    parser.add_argument("--rope-factor", type=float, default=None, dest="rope_factor")
+    parser.add_argument("--rope-beta-fast", type=float, default=None, dest="rope_beta_fast")
+    parser.add_argument("--rope-beta-slow", type=float, default=None, dest="rope_beta_slow")
+    parser.add_argument(
+        "--rope-original-max-position-embeddings",
+        type=int,
+        default=None,
+        dest="rope_original_max_position_embeddings",
+    )
+    parser.add_argument("--rope-attention-factor", type=float, default=None, dest="rope_attention_factor")
 
 
 def _add_multi_token_prediction_args(parser: argparse.ArgumentParser) -> None:
@@ -118,6 +139,8 @@ def _add_train_model_parser_args(parser: argparse.ArgumentParser, *, include_mtp
     parser.add_argument("--num-hidden-layers", type=int, default=None, dest="num_hidden_layers")
     parser.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
     _add_attention_parser_args(parser)
+    _add_norm_parser_args(parser)
+    _add_rope_parser_args(parser)
     if include_mtp:
         _add_multi_token_prediction_args(parser)
 
@@ -172,7 +195,7 @@ def _add_infer_model_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--group-num", type=int, default=None, dest="group_num")
     parser.add_argument("--vocab-size", type=int, default=None, dest="vocab_size")
     parser.add_argument("--rms-norm-eps", type=float, default=None, dest="rms_norm_eps")
-    parser.add_argument("--rope-base", type=int, default=None, dest="rope_base")
+    parser.add_argument("--rope-theta", type=int, default=None, dest="rope_theta")
     parser.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
     parser.add_argument("--flash-attention", nargs="?", const="1", default=None, dest="flash_attention", help="0/1 或省略即 1")
     parser.add_argument("--num-experts-per-token", type=int, default=None, dest="num_experts_per_token")
@@ -185,6 +208,8 @@ def _add_infer_model_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--capacity-factor", type=float, default=None, dest="capacity_factor")
     parser.add_argument("--mtp-level", type=int, default=None, dest="mtp_level", choices=[0, 1, 2])
     _add_attention_parser_args(parser)
+    _add_norm_parser_args(parser)
+    _add_rope_parser_args(parser)
 
 
 def _add_infer_generation_parser_args(parser: argparse.ArgumentParser) -> None:
@@ -241,6 +266,13 @@ def _overlay_file_config(config_dict: dict[str, Any], config_path: Path | None) 
         return
 
     file_dict = _load_json_or_yaml(config_path)
+
+    # Training configs now use `data_max_seq_len` to mean dataset truncation
+    # length. Keep old config files using `max_seq_len` working during the
+    # migration period.
+    if "data_max_seq_len" in config_dict and "data_max_seq_len" not in file_dict and "max_seq_len" in file_dict:
+        file_dict["data_max_seq_len"] = file_dict["max_seq_len"]
+
     for key, value in file_dict.items():
         if key in config_dict and value is not None:
             config_dict[key] = value

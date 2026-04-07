@@ -9,8 +9,9 @@
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
 from torch.utils.data import Dataset
+
+from datasets import load_dataset
 
 
 class PretrainDataset(Dataset):
