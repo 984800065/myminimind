@@ -2,8 +2,7 @@ import math
 from typing import Protocol
 
 import torch
-import triton
-from liger_kernel.ops.rope import _triton_rope
+from liger_kernel.transformers import liger_rotary_pos_emb
 from torch import nn
 
 from myminimind.model.configuration_myminimind import MyMiniMindConfig
@@ -89,74 +88,6 @@ class RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class LigerRopeFunction(torch.autograd.Function):
-
-    @staticmethod
-    def forward(ctx, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
-        """
-        q size: (bsz, n_q_head, seq_len, head_dim)
-        k size: (bsz, n_kv_head, seq_len, head_dim)
-        cos size: (1, seq_len, head_dim)
-        sin size: (1, seq_len, head_dim)
-        """
-
-        # transpose it back to the physical shape because Triton looks at the physical storage
-        # note: q and k are incontiguous before the transformation and will become contiguous after transpose
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-
-        batch_size, seq_len, n_q_head, head_dim = q.shape
-        n_kv_head = k.shape[2]
-        pad_hd = triton.next_power_of_2(head_dim)
-        pad_n_q_head = triton.next_power_of_2(n_q_head)
-        pad_n_kv_head = triton.next_power_of_2(n_kv_head)
-        BLOCK_SIZE = max(pad_n_q_head, pad_n_kv_head)
-
-        n_row = batch_size * seq_len
-
-        # Added: enforce the tensor to be contiguous
-        q = q.contiguous()
-        k = k.contiguous()
-
-        cos_batch_size = cos.shape[0]
-
-        _triton_rope[(n_row,)](
-            q,
-            q.stride(1),
-            k,
-            k.stride(1),
-            cos,
-            cos.stride(-2),
-            sin,
-            sin.stride(-2),
-            seq_len,
-            batch_size,
-            cos_batch_size,
-            n_q_head,
-            n_kv_head,
-            head_dim,
-            pad_n_q_head,
-            pad_n_kv_head,
-            pad_hd,
-            BLOCK_SIZE=BLOCK_SIZE,
-            BACKWARD_PASS=False,
-        )
-
-        ctx.save_for_backward(cos, sin)
-        return q.transpose(1, 2), k.transpose(1, 2)
-
-
-def liger_rotary_pos_emb(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: torch.Tensor | None = None,
-    unsqueeze_dim: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return LigerRopeFunction.apply(q, k, cos, sin, position_ids, unsqueeze_dim)
-
-
 def apply_rotary_pos_emb_interleave(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -208,7 +139,6 @@ def build_apply_rotary_pos_emb(config: MyMiniMindConfig) -> ApplyRotaryPosEmbFn:
 __all__ = [
     "ApplyRotaryPosEmbFn",
     "RotaryEmbedding",
-    "LigerRopeFunction",
     "apply_rotary_pos_emb_interleave",
     "liger_rotary_pos_emb",
     "build_apply_rotary_pos_emb",

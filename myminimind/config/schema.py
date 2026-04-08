@@ -144,8 +144,12 @@ class TrainConfig(BaseConfig):
         description="Norm 实现名称；当前内置支持: layer_eager / rms_eager / rms_liger，可继续扩展",
     )
     rope_implementation: str = Field(
-        "eager",
+        "liger",
         description="RoPE 实现名称；当前内置支持: eager / liger，可继续扩展",
+    )
+    linear_cross_entropy_implementation: str = Field(
+        "liger_fused",
+        description="LM head + CrossEntropy 实现名称；当前内置支持: eager / liger_fused，可继续扩展",
     )
     rope_type: str | None = Field("default", description="RoPE scaling 类型；会写入 rope_scaling['rope_type']")
     rope_factor: float | None = Field(16, gt=0.0, description="RoPE scaling 因子；会写入 rope_scaling['factor']")
@@ -425,8 +429,12 @@ class InferConfig(BaseSettings):
         description="Norm 实现名称；当前内置支持: layer_eager / rms_eager / rms_liger，可继续扩展",
     )
     rope_implementation: str = Field(
-        "eager",
+        "liger",
         description="RoPE 实现名称；当前内置支持: eager / liger，可继续扩展",
+    )
+    linear_cross_entropy_implementation: str = Field(
+        "liger_fused",
+        description="LM head + CrossEntropy 实现名称；主要影响训练时 labels loss 路径；当前内置支持: eager / liger_fused",
     )
     rope_theta: int = Field(1_000_000, gt=0, description="RoPE theta/base")
     rope_type: str | None = Field("default", description="RoPE scaling 类型；会写入 rope_scaling['rope_type']")

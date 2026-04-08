@@ -1,7 +1,7 @@
 from typing import Any
 
 import torch
-from liger_kernel.transformers.rms_norm import LigerRMSNorm
+from liger_kernel.transformers import LigerRMSNorm
 from torch import nn
 
 from myminimind.model.configuration_myminimind import MyMiniMindConfig

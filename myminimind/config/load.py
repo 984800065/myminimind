@@ -104,6 +104,16 @@ def _add_norm_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--norm-implementation", type=str, default=None, dest="norm_implementation")
 
 
+def _add_linear_cross_entropy_parser_args(parser: argparse.ArgumentParser) -> None:
+    """给命令行解析器补充 LM head loss 实现选择参数。"""
+    parser.add_argument(
+        "--linear-cross-entropy-implementation",
+        type=str,
+        default=None,
+        dest="linear_cross_entropy_implementation",
+    )
+
+
 def _add_rope_parser_args(parser: argparse.ArgumentParser) -> None:
     """给命令行解析器补充扁平的 RoPE scaling 参数，随后由 schema 组装为 `rope_scaling` 字典。"""
     parser.add_argument("--rope-implementation", type=str, default=None, dest="rope_implementation")
@@ -140,6 +150,7 @@ def _add_train_model_parser_args(parser: argparse.ArgumentParser, *, include_mtp
     parser.add_argument("--use-moe", nargs="?", const="1", default=None, dest="use_moe", help="0/1 或省略即 1")
     _add_attention_parser_args(parser)
     _add_norm_parser_args(parser)
+    _add_linear_cross_entropy_parser_args(parser)
     _add_rope_parser_args(parser)
     if include_mtp:
         _add_multi_token_prediction_args(parser)
@@ -209,6 +220,7 @@ def _add_infer_model_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mtp-level", type=int, default=None, dest="mtp_level", choices=[0, 1, 2])
     _add_attention_parser_args(parser)
     _add_norm_parser_args(parser)
+    _add_linear_cross_entropy_parser_args(parser)
     _add_rope_parser_args(parser)
 
 

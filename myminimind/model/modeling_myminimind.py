@@ -14,6 +14,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs
 
 from .configuration_myminimind import MyMiniMindConfig
+from .linear_cross_entropy import build_linear_cross_entropy
 from .norms import LayerNorm, RMSNorm, build_norm
 from .ropes import ApplyRotaryPosEmbFn, RotaryEmbedding, apply_rotary_pos_emb_interleave, build_apply_rotary_pos_emb
 
@@ -858,6 +859,7 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = MyMiniMindModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.linear_cross_entropy = build_linear_cross_entropy(config, ignore_index=-100)
         
         self.mtp_level = config.mtp_level
         self.mtp_lambda = config.mtp_lambda
@@ -893,6 +895,63 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
         if missing_keys is not None:
             missing_keys.discard("lm_head.weight")
 
+    def _compute_mtp_loss(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the main-token and MTP token losses with a shared backend."""
+
+        # hidden_states.shape == (mtp_level + 1, batch_size, seq_len, hidden_size)
+        # labels.shape == (batch_size, seq_len)
+        loss = torch.scalar_tensor(0.0, device=hidden_states.device)
+        last_step_hidden: torch.Tensor | None = None
+        last_step_labels: torch.Tensor | None = None
+
+        for mtp_step in range(self.mtp_level + 1):
+            # hidden_states[mtp_step].shape == (batch_size, seq_len, hidden_size)
+            #
+            # Old eager path:
+            #   logits = lm_head(hidden_states[mtp_step][:, mtp_step:, :])
+            #   # logits.shape == (batch_size, seq_len - mtp_step, vocab_size)
+            #   shift_logits = logits[..., :-1, :]
+            #   # shift_logits.shape == (batch_size, seq_len - mtp_step - 1, vocab_size)
+            #   shift_labels = labels[:, mtp_step + 1:]
+            #   # shift_labels.shape == (batch_size, seq_len - mtp_step - 1)
+            #
+            # New fused-friendly path:
+            # we slice hidden states first, so each remaining hidden state still
+            # predicts the next token, but we do not materialize full logits.
+            step_hidden = hidden_states[mtp_step][:, mtp_step:-1, :].contiguous()
+            # step_hidden.shape == (batch_size, seq_len - mtp_step - 1, hidden_size)
+            step_labels = labels[:, mtp_step + 1 :].contiguous()
+            # step_labels.shape == (batch_size, seq_len - mtp_step - 1)
+
+            flat_hidden = step_hidden.view(-1, step_hidden.size(-1))
+            # flat_hidden.shape == (batch_size * (seq_len - mtp_step - 1), hidden_size)
+            flat_labels = step_labels.view(-1)
+            # flat_labels.shape == (batch_size * (seq_len - mtp_step - 1),)
+
+            loss = loss + self.linear_cross_entropy(
+                self.lm_head,
+                flat_hidden,
+                flat_labels,
+            )
+            last_step_hidden = step_hidden
+            last_step_labels = step_labels
+
+        loss = self.mtp_lambda * loss / (self.mtp_level + 1)
+
+        if not torch.isfinite(loss).all():
+            assert last_step_hidden is not None and last_step_labels is not None
+            raise FloatingPointError(
+                "loss is not finite, "
+                f"step_hidden_shape={tuple(last_step_hidden.shape)}, "
+                f"step_labels_shape={tuple(last_step_labels.shape)}"
+            )
+
+        return loss
+
     def forward(
         self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, labels: torch.Tensor | None = None, past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, use_cache: bool = False, logits_to_keep: int | torch.Tensor = 0, return_dict: bool | None = None, **kwargs
     ) -> MyCausalLMOutputWithPast | tuple:
@@ -918,23 +977,7 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
 
         loss: torch.Tensor | None = None
         if labels is not None:
-            loss = torch.scalar_tensor(0.0, device=hidden_states.device)
-            for mtp_step in range(self.mtp_level + 1):
-                # logits.shape == (batch_size, seq_len - mtp_step, vocab_size)
-                logits: torch.Tensor = self.lm_head(hidden_states[mtp_step][:, mtp_step:, :])
-                # shift_logits.shape == (batch_size, seq_len - mtp_step - 1, vocab_size)
-                shift_logits = logits[..., :-1, :].contiguous()
-
-                # labels.shape == (batch_size, seq_len)
-                # shift_labels.shape == (batch_size, seq_len - mtp_step - 1)
-                shift_labels = labels[:, mtp_step + 1:].contiguous()
-                # label中句子完成之后的padding token的id被赋值成了-100，因此这些token不计入损失
-                loss = loss + F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
-            
-            loss = self.mtp_lambda * loss / (self.mtp_level + 1)
-
-            if not torch.isfinite(loss).all():
-                raise FloatingPointError(f"loss is not finite, shift_logits: {shift_logits}, shift_labels: {shift_labels}")
+            loss = self._compute_mtp_loss(hidden_states, labels)
 
         # logits.shape == (batch_size, seq_len, vocab_size)
         logits: torch.Tensor = self.lm_head(hidden_states[0])

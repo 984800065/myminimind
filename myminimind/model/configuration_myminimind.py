@@ -57,7 +57,8 @@ class MyMiniMindConfig(PretrainedConfig):
         vocab_size: int = 6400,
         rms_norm_eps: float = 1e-5,
         norm_implementation: str = "rms_liger",
-        rope_implementation: str = "eager",
+        rope_implementation: str = "liger",
+        linear_cross_entropy_implementation: str = "liger_fused",
         rope_theta: int = 1_000_000,
         # Hugging Face style RoPE scaling payload.
         # Common keys:
@@ -124,6 +125,10 @@ class MyMiniMindConfig(PretrainedConfig):
         # This flag is used to choose how q/k rotary application is done later
         # in `build_apply_rotary_pos_emb(...)`.
         self.rope_implementation = rope_implementation
+
+        # Final LM-head loss implementation.
+        # This only affects training-time `labels` loss computation.
+        self.linear_cross_entropy_implementation = linear_cross_entropy_implementation.lower()
 
         # Group Query Attention configurations
         self.num_attention_heads = num_attention_heads
