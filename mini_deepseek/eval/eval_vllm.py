@@ -9,7 +9,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 from transformers import AutoTokenizer
 
-from myminimind.config import get_infer_config
+from mini_deepseek.config import get_infer_config
 
 
 def _build_prompt(tokenizer, infer_cfg, conversation, prompt: str) -> str:

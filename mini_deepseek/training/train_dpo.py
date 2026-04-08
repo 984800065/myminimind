@@ -1,5 +1,5 @@
 """
-MiniMind Full SFT 入口：get_sft_config() 加载参数，DDP + 混合精度 + swanlab。
+MiniDeepSeek DPO 入口：get_dpo_config() 加载参数，DDP + 混合精度 + swanlab。
 """
 
 import os
@@ -9,18 +9,23 @@ from contextlib import nullcontext
 import swanlab
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
-from myminimind.config import SFTConfig, get_sft_config
-from myminimind.data import SFTDataset
-from myminimind.model.configuration_myminimind import MyMiniMindConfig
-from myminimind.model.modular_myminimind import MyCausalLMOutputWithPast, MyMiniMindForCausalLM
-from myminimind.utils.logger import logger
-from myminimind.utils.train_utils import (
+from mini_deepseek.config import DPOConfig, get_dpo_config
+from mini_deepseek.data import DPODataset
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
+from mini_deepseek.model.modeling_mini_deepseek import (
+    MiniDeepSeekCausalLMOutputWithPast as CausalLMOutputWithPast,
+)
+from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekForCausalLM
+from mini_deepseek.utils.logger import logger
+from mini_deepseek.utils.train_utils import (
     SkipBatchSampler,
+    get_swanlab_experiment_name,
     init_distributed,
     init_model,
     is_main_process,
@@ -31,18 +36,62 @@ from myminimind.utils.train_utils import (
 )
 
 
+def logits_to_log_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # logits.shape == (batch_size, seq_len, vocab_size)
+    # labels.shape == (batch_size, seq_len)
+    assert len(labels.shape) == 2, f"labels.shape: {labels.shape}"
+
+    # (batch_size, seq_len, vocab_size)
+    log_probs = torch.log_softmax(logits, dim=-1)
+    # (batch_size, seq_len, 1)
+    log_probs = log_probs.gather(dim=-1, index=labels[:, :, None])
+    # (batch_size, seq_len)
+    log_probs = log_probs.squeeze(-1)
+    return log_probs
+
+
+def get_dop_loss(ref_log_probs: torch.Tensor, policy_log_probs: torch.Tensor, mask: torch.Tensor, beta: float) -> torch.Tensor:
+    # ref_log_probs.shape == (batch_size, seq_len)
+    # policy_log_probs.shape == (batch_size, seq_len)
+    # mask.shape == (batch_size, seq_len)
+
+    # 防止零长度mask导致除零NaN
+    # (batch_size, )
+    seq_lengths = mask.sum(dim=-1).clamp_min(1e-8)
+
+    # (batch_size, )
+    ref_log_probs = (ref_log_probs * mask).sum(dim=-1) / seq_lengths
+    # (batch_size, )
+    policy_log_probs = (policy_log_probs * mask).sum(dim=-1) / seq_lengths
+
+    # 将 chosen 和 rejected 数据分开
+    batch_size = ref_log_probs.shape[0]
+    chosen_log_probs = ref_log_probs[: batch_size // 2]
+    rejected_log_probs = ref_log_probs[batch_size // 2 :]
+    chosen_policy_log_probs = policy_log_probs[: batch_size // 2]
+    rejected_policy_log_probs = policy_log_probs[batch_size // 2 :]
+
+    pi_logratios = chosen_policy_log_probs - rejected_policy_log_probs
+    ref_logratios = chosen_log_probs - rejected_log_probs
+    logits = pi_logratios - ref_logratios
+    loss = -F.logsigmoid(beta * logits)
+    return loss.mean()
+
+
 def train_epoch(
-    cfg: SFTConfig,
+    cfg: DPOConfig,
     epoch: int,
     loader: DataLoader,
-    model: MyMiniMindForCausalLM,
+    model: MiniDeepSeekForCausalLM,
+    ref_model: MiniDeepSeekForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    scaler: torch.GradScaler,
-    autocast_ctx: nullcontext | torch.autocast,
-    lm_config: MyMiniMindConfig,
+    scaler: torch.amp.GradScaler,
+    autocast_ctx: nullcontext | torch.amp.autocast,
+    lm_config: MiniDeepSeekConfig,
     start_step: int = 0,
     swanlab_: swanlab.Run | None = None,
+    beta: float = 0.1,
 ) -> None:
     model.train()
     start_time = time.time()
@@ -55,24 +104,38 @@ def train_epoch(
     epoch_avg_loss = 0.0
     epoch_avg_aux_loss = 0.0
     cur_step = 0
-    for step, (input_ids, labels) in enumerate(pbar, start=start_step):
-        input_ids: torch.Tensor
-        labels: torch.Tensor
-        input_ids = input_ids.to(cfg.device)
-        labels = labels.to(cfg.device)
+    for step, sample_pair in enumerate(pbar, start=start_step):
+        # (batch_size, seq_len)
+        x_chosen: torch.Tensor = sample_pair["x_chosen"]
+        y_chosen: torch.Tensor = sample_pair["y_chosen"]
+        mask_chosen: torch.Tensor = sample_pair["mask_chosen"]
+        x_rejected: torch.Tensor = sample_pair["x_rejected"]
+        y_rejected: torch.Tensor = sample_pair["y_rejected"]
+        mask_rejected: torch.Tensor = sample_pair["mask_rejected"]
+
+        x = torch.cat([x_chosen, x_rejected], dim=0).to(cfg.device)
+        y = torch.cat([y_chosen, y_rejected], dim=0).to(cfg.device)
+        mask = torch.cat([mask_chosen, mask_rejected], dim=0).to(cfg.device)
 
         with autocast_ctx:
-            res: MyCausalLMOutputWithPast = model(input_ids=input_ids, labels=labels)
-            assert res.loss is not None
-            assert res.aux_loss is not None
-            loss = res.loss + res.aux_loss
+            with torch.no_grad():
+                ref_outputs: CausalLMOutputWithPast = ref_model(x)
+                ref_logits = ref_outputs.logits
+            ref_log_probs = logits_to_log_probs(ref_logits, y)
+
+            outputs: CausalLMOutputWithPast = model(x)
+            logits = outputs.logits
+            policy_log_probs = logits_to_log_probs(logits, y)
+
+            dpo_loss = get_dop_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            loss: torch.Tensor = dpo_loss + outputs.aux_loss
 
             cur_loss = loss.item()
-            cur_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            cur_aux_loss = outputs.aux_loss.item() if outputs.aux_loss is not None else 0.0
 
-            loss = loss / cfg.accumulation_steps
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
+            loss = loss / cfg.accumulation_steps
             cur_step += 1
             pbar.set_postfix({"batch_loss": cur_loss, "epoch_avg_loss": epoch_avg_loss / cur_step, "batch_aux_loss": cur_aux_loss, "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step})
 
@@ -92,7 +155,7 @@ def train_epoch(
 
         if step % cfg.log_interval == 0 or step == total_iters - 1:
             spend_time = time.time() - start_time
-            cur_logits_loss = cur_loss - cur_aux_loss
+            cur_dpo_loss = cur_loss - cur_aux_loss
             current_lr = lr_scheduler.get_last_lr()[0]
             eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
             log_swanlab_training_metrics(
@@ -105,8 +168,8 @@ def train_epoch(
                 elapsed_seconds=spend_time,
                 eta_minutes=float(eta_min),
                 train_metrics={
-                    "loss": cur_loss,
-                    "logits_loss": cur_logits_loss,
+                    "total_loss": cur_loss,
+                    "dpo_loss": cur_dpo_loss,
                     "aux_loss": cur_aux_loss,
                 },
             )
@@ -125,19 +188,21 @@ def train_epoch(
             )
             model.train()
 
-        del input_ids, labels, res, loss
+        del x_chosen, y_chosen, mask_chosen, x_rejected, y_rejected, mask_rejected, x, y, mask
+        del ref_outputs, ref_logits, ref_log_probs, outputs, logits, policy_log_probs, dpo_loss, loss
 
 
 def train(
-    cfg: SFTConfig,
-    model: MyMiniMindForCausalLM,
+    cfg: DPOConfig,
+    model: MiniDeepSeekForCausalLM,
+    ref_model: MiniDeepSeekForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    scaler: torch.GradScaler,
+    scaler: torch.amp.GradScaler,
     autocast_ctx,
-    lm_config: MyMiniMindConfig,
+    lm_config: MiniDeepSeekConfig,
     train_sampler: DistributedSampler | None,
-    train_dataset: SFTDataset,
+    train_dataset: DPODataset,
     last_end_epoch: int,
     last_end_step: int,
     swanlab_=None,
@@ -159,13 +224,14 @@ def train(
 
         if skip > 0:
             logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 跳过前 {skip} step，从 step {skip} 开始")
-            train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, skip, swanlab_)
+            train_epoch(cfg, epoch, loader, model, ref_model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, skip, swanlab_, cfg.beta)
         else:
-            train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, 0, swanlab_)
+            logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 从头开始训练")
+            train_epoch(cfg, epoch, loader, model, ref_model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, 0, swanlab_, cfg.beta)
 
 
 def main():
-    cfg = get_sft_config()
+    cfg = get_dpo_config()
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed()
@@ -181,15 +247,14 @@ def main():
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in cfg.device else "cpu"
     dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.autocast(device_type=device_type, dtype=dtype)
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
 
     # ========== 4. 配swanlab ==========
     swanlab_ = None
     if cfg.use_swanlab and is_main_process():
         swanlab_id = ckp_data.get("swanlab_id", None) if ckp_data else None
         resume = "must" if swanlab_id else None
-        model_name = f"MiniMind{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}"
-        name = f"{model_name}-SFT-E{cfg.epochs}-B{cfg.batch_size}-LR{cfg.learning_rate}"
+        name = get_swanlab_experiment_name(cfg)
         swanlab.init(project=cfg.swanlab_project, name=name, id=swanlab_id, resume=resume)
         swanlab_ = swanlab
 
@@ -202,10 +267,20 @@ def main():
     if cfg.use_compile:
         model = torch.compile(model)
         logger.info("torch.compile enabled")
+    logger.info(f"策略模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M")
 
-    train_dataset = SFTDataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
+    ref_model, _ = init_model(
+        cfg=cfg,
+        lm_config=lm_config,
+        tokenizer=tokenizer,
+    )
+    ref_model.eval()
+    ref_model.requires_grad_(False)
+    logger.info(f"参考模型总参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M")
+
+    train_dataset = DPODataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
-    scaler = torch.GradScaler(enabled=(cfg.dtype == "float16"))
+    scaler = torch.amp.GradScaler(enabled=(cfg.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     cur_rank_total_samples = len(train_sampler) if train_sampler is not None else len(train_dataset)
     micro_batches_per_epoch = (cur_rank_total_samples + cfg.batch_size - 1) // cfg.batch_size
@@ -225,12 +300,14 @@ def main():
 
     # ========== 7. DDP包模型 ==========
     if dist.is_initialized():
+        model._ddp_params_and_buffers_to_ignore = {"cos_phi", "sin_phi"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     # ========== 8. 开始训练 ==========
     train(
         cfg,
         model,
+        ref_model,
         optimizer,
         lr_scheduler,
         scaler,

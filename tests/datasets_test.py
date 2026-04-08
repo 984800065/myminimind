@@ -5,7 +5,7 @@ import pytest
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-DEFAULT_TOKENIZER_PATH = Path("myminimind/config/tokenizer")
+DEFAULT_TOKENIZER_PATH = Path("mini_deepseek/config/tokenizer")
 DEFAULT_PRETRAIN_DATA_PATH = Path("dataset/pretrain_hq.jsonl")
 DEFAULT_SFT_DATA_PATH = Path("dataset/sft_512.jsonl")
 

@@ -3,8 +3,8 @@ from typing import TYPE_CHECKING
 from transformers.utils.import_utils import _LazyModule, define_import_structure
 
 if TYPE_CHECKING:
-    from .configuration_myminimind import *
-    from .modeling_myminimind import *
+    from .configuration_mini_deepseek import *
+    from .modeling_mini_deepseek import *
 else:
     import sys
 

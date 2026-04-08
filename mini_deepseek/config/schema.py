@@ -38,15 +38,15 @@ def _settings_config(env_prefix: str) -> SettingsConfigDict:
 
 @lru_cache(maxsize=1)
 def _model_config_field_names() -> tuple[str, ...]:
-    """Use `MyMiniMindConfig` as the single source of truth for model fields."""
-    from myminimind.model.configuration_myminimind import MyMiniMindConfig
+    """Use `MiniDeepSeekConfig` as the single source of truth for model fields."""
+    from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
 
-    signature = inspect.signature(MyMiniMindConfig.__init__)
+    signature = inspect.signature(MiniDeepSeekConfig.__init__)
     return tuple(name for name in signature.parameters if name not in {"self", "kwargs"})
 
 
 def _lm_config_kwargs(config: object, **extra) -> dict:
-    """Collect fields that both the runtime config and `MyMiniMindConfig` define."""
+    """Collect fields that both the runtime config and `MiniDeepSeekConfig` define."""
     kwargs = {
         name: getattr(config, name)
         for name in _model_config_field_names()
@@ -129,7 +129,7 @@ class TrainConfig(BaseConfig):
     # ----- 分词器 -----
     tokenizer_path: str = Field(DEFAULT_TOKENIZER_PATH, description="分词器路径")
 
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
     hidden_size: int = Field(1024, gt=0, description="隐藏层维度")
     num_hidden_layers: int = Field(8, gt=0, description="隐藏层数量")
     use_moe: bool = Field(False, description="是否使用 MoE 架构")
@@ -148,7 +148,7 @@ class TrainConfig(BaseConfig):
         description="RoPE 实现名称；当前内置支持: eager / liger，可继续扩展",
     )
     linear_cross_entropy_implementation: str = Field(
-        "liger_fused",
+        "eager",
         description="LM head + CrossEntropy 实现名称；当前内置支持: eager / liger_fused，可继续扩展",
     )
     rope_type: str | None = Field("default", description="RoPE scaling 类型；会写入 rope_scaling['rope_type']")
@@ -178,7 +178,7 @@ class TrainConfig(BaseConfig):
     # ----- DeepSpeed -----
     use_deepspeed: bool = Field(False, description="是否启用 DeepSpeed 训练引擎")
     deepspeed_config: str | None = Field(None, description="DeepSpeed 配置文件路径；为空时按当前训练参数自动生成")
-    deepspeed_zero_stage: Literal[0, 1, 2] = Field(2, description="DeepSpeed ZeRO stage（当前预训练入口建议使用 0/1/2）")
+    deepspeed_zero_stage: Literal[0, 1, 2] = Field(0, description="DeepSpeed ZeRO stage（当前预训练入口建议使用 0/1/2）")
     deepspeed_offload_optimizer: bool = Field(False, description="是否启用 DeepSpeed CPU optimizer offload")
     deepspeed_tensor_parallel_size: int = Field(1, gt=0, description="DeepSpeed AutoTP 大小；1 表示关闭张量并行")
     
@@ -189,8 +189,8 @@ class TrainConfig(BaseConfig):
         """
         从当前训练配置中自动抽出模型字段，并显式同步 `max_seq_len`。
 
-        用法：lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
-        训练侧把 `data_max_seq_len` 视为数据截断长度，同时也把它作为训练时模型上下文长度传给 `MiniMindConfig`。
+        用法：lm_config = MiniDeepSeekConfig(**cfg.to_lm_config_kwargs())
+        训练侧把 `data_max_seq_len` 视为数据截断长度，同时也把它作为训练时模型上下文长度传给 `MiniDeepSeekConfig`。
         """
         return _lm_config_kwargs(
             self,
@@ -206,7 +206,7 @@ class PretrainConfig(TrainConfig):
     使用方式：不要手写 PretrainConfig(xxx)，而是用 get_pretrain_config() 得到实例，例如：
       cfg = get_pretrain_config()
       cfg.batch_size
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+      lm_config = MiniDeepSeekConfig(**cfg.to_lm_config_kwargs())
     """
 
     # ----- 保存与输出 -----
@@ -224,7 +224,7 @@ class PretrainConfig(TrainConfig):
     data_path: str = Field("/home/dkr/.cache/huggingface/datasets/fineweb/sample/10BT", description="预训练数据路径（jsonl）")
 
     # ----- 实验与工具 -----
-    swanlab_project: str = Field("MiniMind-Pretrain", description="swanlab 项目名")
+    swanlab_project: str = Field("MiniDeepSeek-Pretrain", description="swanlab 项目名")
 
 
 class SFTConfig(TrainConfig):
@@ -233,7 +233,7 @@ class SFTConfig(TrainConfig):
 
     使用方式：用 get_sft_config() 得到实例，例如：
       cfg = get_sft_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+      lm_config = MiniDeepSeekConfig(**cfg.to_lm_config_kwargs())
     """
 
     model_config = _settings_config("SFT_")
@@ -248,7 +248,7 @@ class SFTConfig(TrainConfig):
     # ----- 数据 -----
     data_path: str = Field("./dataset/sft_512.jsonl", description="SFT 训练数据路径（jsonl）")
 
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
     use_moe: bool = Field(True, description="是否使用 MoE 架构")
 
     # ----- 恢复与续训 -----
@@ -256,7 +256,7 @@ class SFTConfig(TrainConfig):
     from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
 
     # ----- 实验与工具 -----
-    swanlab_project: str = Field("MiniMind-Full-SFT", description="swanlab 项目名")
+    swanlab_project: str = Field("MiniDeepSeek-Full-SFT", description="swanlab 项目名")
 
 
 class DPOConfig(TrainConfig):
@@ -265,7 +265,7 @@ class DPOConfig(TrainConfig):
 
     使用方式：用 get_dpo_config() 得到实例，例如：
       cfg = get_dpo_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+      lm_config = MiniDeepSeekConfig(**cfg.to_lm_config_kwargs())
     """
 
     model_config = _settings_config("DPO_")
@@ -282,7 +282,7 @@ class DPOConfig(TrainConfig):
     # ----- 数据 -----
     data_path: str = Field("./dataset/dpo.jsonl", description="DPO 训练数据路径（jsonl）")
 
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
     hidden_size: int = Field(512, gt=0, description="隐藏层维度")
 
     # ----- 恢复与续训 -----
@@ -294,7 +294,7 @@ class DPOConfig(TrainConfig):
 
     # ----- 实验与工具 -----
     use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-DPO", description="swanlab 项目名")
+    swanlab_project: str = Field("MiniDeepSeek-DPO", description="swanlab 项目名")
 
 
 class GRPOConfig(TrainConfig):
@@ -303,7 +303,7 @@ class GRPOConfig(TrainConfig):
 
     使用方式：用 get_grpo_config() 得到实例，例如：
       cfg = get_grpo_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+      lm_config = MiniDeepSeekConfig(**cfg.to_lm_config_kwargs())
     """
 
     model_config = _settings_config("GRPO_")
@@ -325,7 +325,7 @@ class GRPOConfig(TrainConfig):
     max_gen_len: int = Field(1536, gt=0, description="生成的最大长度")
     num_generations: int = Field(8, gt=0, description="每个 prompt 生成的样本数")
 
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
     hidden_size: int = Field(512, gt=0, description="隐藏层维度")
 
     # ----- 恢复与续训 -----
@@ -344,7 +344,7 @@ class GRPOConfig(TrainConfig):
 
     # ----- 实验与工具 -----
     use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-GRPO", description="swanlab 项目名")
+    swanlab_project: str = Field("MiniDeepSeek-GRPO", description="swanlab 项目名")
 
     def to_lm_config_kwargs(self) -> dict:
         """构建 policy / reference 模型配置，并把上下文长度设为 prompt + generation。"""
@@ -361,7 +361,7 @@ class DistillationConfig(TrainConfig):
 
     使用方式：用 get_distillation_config() 得到实例，例如：
       cfg = get_distillation_config()
-      lm_config = MiniMindConfig(**cfg.to_lm_config_kwargs())
+      lm_config = MiniDeepSeekConfig(**cfg.to_lm_config_kwargs())
     """
 
     model_config = _settings_config("DISTILL_")
@@ -378,7 +378,7 @@ class DistillationConfig(TrainConfig):
     data_path: str = Field("./dataset/sft_mini_512.jsonl", description="蒸馏训练数据路径（jsonl）")
     data_max_seq_len: int = Field(340, gt=0, description="训练数据截断长度（token）")
 
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
     hidden_size: int = Field(512, gt=0, description="隐藏层维度")
 
     # ----- 恢复与续训 -----
@@ -387,7 +387,7 @@ class DistillationConfig(TrainConfig):
 
     # ----- 实验与工具 -----
     use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")
-    swanlab_project: str = Field("MiniMind-Distillation", description="swanlab 项目名")
+    swanlab_project: str = Field("MiniDeepSeek-Distillation", description="swanlab 项目名")
 
 
 class InferConfig(BaseSettings):
@@ -408,7 +408,7 @@ class InferConfig(BaseSettings):
     model_config_path: str | None = Field(None, description="模型配置目录或 config.json 路径；用于原始 .pth 权重加载")
     hf_model_dir: str | None = Field(None, description="已导出的 Hugging Face 模型目录；提供后优先从该目录加载")
 
-    # ----- 模型结构（与 MiniMindConfig 对齐） -----
+    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
     hidden_act: str = Field("silu", description="激活函数名称")
     hidden_size: int = Field(1024, gt=0, description="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
     intermediate_size: int | None = Field(None, gt=0, description="MLP 中间层维度；None 表示按 hidden_size 自动推导")
@@ -487,7 +487,7 @@ class InferConfig(BaseSettings):
     device: str = Field(default_factory=_default_device, description="运行设备")
 
     def to_lm_config_kwargs(self) -> dict:
-        """抽出当前推理配置中与 `MyMiniMindConfig` 同名的字段。"""
+        """抽出当前推理配置中与 `MiniDeepSeekConfig` 同名的字段。"""
         return _lm_config_kwargs(self, rope_scaling=_build_rope_scaling(self))
 
     def to_vllm_kwargs(self) -> dict:

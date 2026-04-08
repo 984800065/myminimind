@@ -16,7 +16,7 @@
             "type": "debugpy",
             "request": "launch",
             "python": "${workspaceFolder}/.venv/bin/python",
-            "module": "myminimind.training.train_pretrain",
+            "module": "mini_deepseek.training.train_pretrain",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "justMyCode": false,

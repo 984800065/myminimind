@@ -18,7 +18,7 @@ export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
 # 默认 1 卡；设置环境变量 NGPUS=4 可改为 4 卡
 NGPUS="${NGPUS:-1}"
 
-MODULE="myminimind.training.train_pretrain"
+MODULE="mini_deepseek.training.train_pretrain"
 
 COMMON_ARGS=(
   --save-dir out

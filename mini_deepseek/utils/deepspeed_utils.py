@@ -6,9 +6,9 @@ from typing import Any
 
 import torch.distributed as dist
 
-from myminimind.config.schema import TrainConfig
-from myminimind.utils.logger import logger
-from myminimind.utils.train_utils import get_universial_name
+from mini_deepseek.config.schema import TrainConfig
+from mini_deepseek.utils.logger import logger
+from mini_deepseek.utils.train_utils import get_universal_name
 
 
 def _load_json_or_yaml(path: str | Path) -> dict[str, Any]:
@@ -35,7 +35,7 @@ def get_deepspeed_checkpoint_dir(cfg: TrainConfig) -> Path:
     manually pass `save_dir`, `save_weight`, `hidden_size`, `attention_type` and
     other naming pieces around.
     """
-    checkpoint_name = f"{get_universial_name(cfg)}_deepspeed"
+    checkpoint_name = f"{get_universal_name(cfg)}_deepspeed"
     return Path(cfg.save_dir) / checkpoint_name
 
 
@@ -46,7 +46,7 @@ def get_deepspeed_runtime_config_path(cfg: TrainConfig) -> Path:
     This file is only for inspection/debugging; the real training state is still
     owned by DeepSpeed checkpoints.
     """
-    config_name = f"{get_universial_name(cfg)}_deepspeed_config.json"
+    config_name = f"{get_universal_name(cfg)}_deepspeed_config.json"
     return Path(cfg.save_dir) / config_name
 
 
@@ -57,7 +57,7 @@ def get_deepspeed_resume_metadata_path(cfg: TrainConfig) -> Path:
     DeepSpeed itself stores the true checkpoint data. This file only caches
     fields such as `latest_tag`, `epoch`, `step`, and `swanlab_id`.
     """
-    return get_deepspeed_checkpoint_dir(cfg) / "myminimind_resume.json"
+    return get_deepspeed_checkpoint_dir(cfg) / "mini_deepseek_resume.json"
 
 
 def build_deepspeed_config(cfg: TrainConfig) -> dict[str, Any]:

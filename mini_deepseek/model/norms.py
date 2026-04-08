@@ -4,7 +4,7 @@ import torch
 from liger_kernel.transformers import LigerRMSNorm
 from torch import nn
 
-from myminimind.model.configuration_myminimind import MyMiniMindConfig
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
 
 
 class RMSNorm(nn.Module):
@@ -47,7 +47,7 @@ class LayerNorm(nn.Module):
 
 
 def build_norm(
-    config: MyMiniMindConfig,
+    config: MiniDeepSeekConfig,
     hidden_size: int | None = None,
     eps: float | None = None,
     **kwargs: Any,

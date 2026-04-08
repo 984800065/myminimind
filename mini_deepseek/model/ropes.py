@@ -5,7 +5,7 @@ import torch
 from liger_kernel.transformers import liger_rotary_pos_emb
 from torch import nn
 
-from myminimind.model.configuration_myminimind import MyMiniMindConfig
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
 
 
 class ApplyRotaryPosEmbFn(Protocol):
@@ -25,7 +25,7 @@ class ApplyRotaryPosEmbFn(Protocol):
 class RotaryEmbedding(nn.Module):
     freq: torch.Tensor
 
-    def __init__(self, config: MyMiniMindConfig, dim: int):
+    def __init__(self, config: MiniDeepSeekConfig, dim: int):
         """
         显示的穿dim以适配各种不同的rope dim配置
         """
@@ -115,7 +115,7 @@ def apply_rotary_pos_emb_interleave(
     return q_embed, k_embed
 
 
-def build_apply_rotary_pos_emb(config: MyMiniMindConfig) -> ApplyRotaryPosEmbFn:
+def build_apply_rotary_pos_emb(config: MiniDeepSeekConfig) -> ApplyRotaryPosEmbFn:
     """Build the q/k rotary application function selected by `config.rope_implementation`.
 
     In this project RoPE has two parts:

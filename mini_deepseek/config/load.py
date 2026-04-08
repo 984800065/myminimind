@@ -331,7 +331,7 @@ def _build_config[ConfigT: BaseSettings](
 
 def _build_pretrain_parser() -> argparse.ArgumentParser:
     """构建预训练命令行解析器。"""
-    parser = _new_parser("MiniMind 预训练")
+    parser = _new_parser("MiniDeepSeek 预训练")
     _add_save_parser_args(parser)
     _add_train_hparam_parser_args(parser)
     _add_device_dtype_parser_args(parser)
@@ -347,7 +347,7 @@ def _build_pretrain_parser() -> argparse.ArgumentParser:
 
 def _build_infer_parser() -> argparse.ArgumentParser:
     """构建推理/对话命令行解析器。"""
-    parser = _new_parser("MiniMind模型推理与对话")
+    parser = _new_parser("MiniDeepSeek模型推理与对话")
     _add_infer_load_parser_args(parser)
     _add_infer_model_parser_args(parser)
     _add_infer_generation_parser_args(parser)
@@ -357,7 +357,7 @@ def _build_infer_parser() -> argparse.ArgumentParser:
 
 def _build_sft_parser() -> argparse.ArgumentParser:
     """构建 Full SFT 命令行解析器。"""
-    parser = _new_parser("MiniMind Full SFT")
+    parser = _new_parser("MiniDeepSeek Full SFT")
     _add_save_parser_args(parser)
     _add_train_hparam_parser_args(parser)
     _add_device_dtype_parser_args(parser)
@@ -371,7 +371,7 @@ def _build_sft_parser() -> argparse.ArgumentParser:
 
 def _build_dpo_parser() -> argparse.ArgumentParser:
     """构建 DPO 命令行解析器。"""
-    parser = _new_parser("MiniMind DPO (Direct Preference Optimization)")
+    parser = _new_parser("MiniDeepSeek DPO (Direct Preference Optimization)")
     _add_save_parser_args(parser)
     _add_train_hparam_parser_args(parser)
     _add_device_dtype_parser_args(parser)
@@ -386,7 +386,7 @@ def _build_dpo_parser() -> argparse.ArgumentParser:
 
 def _build_grpo_parser() -> argparse.ArgumentParser:
     """构建 GRPO 命令行解析器。"""
-    parser = _new_parser("MiniMind GRPO (Group Relative Policy Optimization)")
+    parser = _new_parser("MiniDeepSeek GRPO (Group Relative Policy Optimization)")
     _add_save_parser_args(parser)
     _add_train_hparam_parser_args(parser)
     _add_device_dtype_parser_args(parser)
@@ -402,7 +402,7 @@ def _build_grpo_parser() -> argparse.ArgumentParser:
 
 def _build_distillation_parser() -> argparse.ArgumentParser:
     """构建 On-policy 蒸馏命令行解析器。"""
-    parser = _new_parser("MiniMind On-policy Distillation (白盒蒸馏)")
+    parser = _new_parser("MiniDeepSeek On-policy Distillation (白盒蒸馏)")
     _add_save_parser_args(parser)
     _add_train_hparam_parser_args(parser)
     _add_device_dtype_parser_args(parser)

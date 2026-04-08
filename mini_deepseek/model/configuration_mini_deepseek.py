@@ -5,8 +5,8 @@ from typing import Any
 from transformers import PretrainedConfig
 
 
-class MyMiniMindConfig(PretrainedConfig):
-    model_type = "myminimind"
+class MiniDeepSeekConfig(PretrainedConfig):
+    model_type = "mini_deepseek"
     # base_model_tp_plan = {
     #     "layers.*.self_attention.q_proj": "colwise",
     #     "layers.*.self_attention.k_proj": "colwise",
@@ -137,8 +137,8 @@ class MyMiniMindConfig(PretrainedConfig):
 
         attention_type = attention_type.lower()
         attention_name_map = {
-            "gqa": "my_gqa",
-            "mla": "my_mla",
+            "gqa": "mini_deepseek_gqa",
+            "mla": "mini_deepseek_mla",
         }
 
         if attention_type not in attention_name_map.keys():
@@ -236,9 +236,9 @@ class MyMiniMindConfig(PretrainedConfig):
         self.mtp_lambda = mtp_lambda
 
 
-def load_myminimind_config(path: str | Path) -> MyMiniMindConfig:
+def load_mini_deepseek_config(path: str | Path) -> MiniDeepSeekConfig:
     """Load a config from a Hugging Face directory or a raw JSON file."""
     config_path = Path(path)
     if config_path.is_file():
-        return MyMiniMindConfig.from_dict(json.loads(config_path.read_text()))
-    return MyMiniMindConfig.from_pretrained(str(config_path))
+        return MiniDeepSeekConfig.from_dict(json.loads(config_path.read_text()))
+    return MiniDeepSeekConfig.from_pretrained(str(config_path))

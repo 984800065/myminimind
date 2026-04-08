@@ -12,14 +12,14 @@ if __package__ is None or __package__ == "":
 
 import torch
 
-from myminimind.config import get_infer_config
-from myminimind.model.configuration_myminimind import MyMiniMindConfig, load_myminimind_config
-from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM, register_myminimind_for_auto_class
-from myminimind.utils.train_utils import get_model_weight_path, load_tokenizer, sync_lm_config_with_tokenizer
+from mini_deepseek.config import get_infer_config
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig, load_mini_deepseek_config
+from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekForCausalLM, register_mini_deepseek_for_auto_class
+from mini_deepseek.utils.train_utils import get_model_weight_path, load_tokenizer, sync_lm_config_with_tokenizer
 
 
 def _parse_args() -> tuple[argparse.Namespace, list[str]]:
-    parser = argparse.ArgumentParser(description="Export a raw MyMiniMind checkpoint to a Hugging Face model directory.")
+    parser = argparse.ArgumentParser(description="Export a raw MiniDeepSeek checkpoint to a Hugging Face model directory.")
     parser.add_argument("--output-dir", type=Path, required=True, help="Export directory for the Hugging Face model")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Explicit checkpoint path; defaults to save_dir/weight_hidden[_moe].pth")
     parser.add_argument(
@@ -40,11 +40,11 @@ def _checkpoint_path(
     return Path(get_model_weight_path(infer_cfg))
 
 
-def _resolve_model_config(infer_cfg, tokenizer) -> MyMiniMindConfig:
+def _resolve_model_config(infer_cfg, tokenizer) -> MiniDeepSeekConfig:
     if infer_cfg.model_config_path:
-        model_config = load_myminimind_config(infer_cfg.model_config_path)
+        model_config = load_mini_deepseek_config(infer_cfg.model_config_path)
     else:
-        model_config = MyMiniMindConfig(**infer_cfg.to_lm_config_kwargs())
+        model_config = MiniDeepSeekConfig(**infer_cfg.to_lm_config_kwargs())
     return sync_lm_config_with_tokenizer(model_config, tokenizer)
 
 
@@ -78,16 +78,16 @@ def main() -> None:
     model_config = _resolve_model_config(infer_cfg, tokenizer)
     state_dict = torch.load(checkpoint_path, map_location="cpu")
 
-    model = MyMiniMindForCausalLM(model_config)
+    model = MiniDeepSeekForCausalLM(model_config)
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     model.config.architectures = [model.__class__.__name__]
 
-    register_myminimind_for_auto_class()
+    register_mini_deepseek_for_auto_class()
     model.config.auto_map = {
-        "AutoConfig": "configuration_myminimind.MyMiniMindConfig",
-        "AutoModel": "modeling_myminimind.MyMiniMindModel",
-        "AutoModelForCausalLM": "modeling_myminimind.MyMiniMindForCausalLM",
+        "AutoConfig": "configuration_mini_deepseek.MiniDeepSeekConfig",
+        "AutoModel": "modeling_mini_deepseek.MiniDeepSeekModel",
+        "AutoModelForCausalLM": "modeling_mini_deepseek.MiniDeepSeekForCausalLM",
     }
     export_state_dict = model.state_dict()
     for tied_target in getattr(model, "all_tied_weights_keys", {}).keys():
@@ -107,7 +107,7 @@ def main() -> None:
         "infer_config": infer_cfg.model_dump(),
         "model_config": model_config.to_dict(),
     }
-    (output_dir / "myminimind_export.json").write_text(json.dumps(export_metadata, ensure_ascii=False, indent=2) + "\n")
+    (output_dir / "mini_deepseek_export.json").write_text(json.dumps(export_metadata, ensure_ascii=False, indent=2) + "\n")
 
     print(f"Exported Hugging Face model to: {output_dir}")
 

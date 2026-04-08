@@ -13,7 +13,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.processing_utils import Unpack
 from transformers.utils.generic import TransformersKwargs
 
-from .configuration_myminimind import MyMiniMindConfig
+from .configuration_mini_deepseek import MiniDeepSeekConfig
 from .linear_cross_entropy import build_linear_cross_entropy
 from .norms import LayerNorm, RMSNorm, build_norm
 from .ropes import ApplyRotaryPosEmbFn, RotaryEmbedding, apply_rotary_pos_emb_interleave, build_apply_rotary_pos_emb
@@ -21,7 +21,7 @@ from .ropes import ApplyRotaryPosEmbFn, RotaryEmbedding, apply_rotary_pos_emb_in
 SUPPORTED_EXPERTS_IMPLEMENTATIONS = {"eager", "grouped_mm", "batched_mm"}
 
 
-def myminimind_gqa_eager_attention_forward(
+def mini_deepseek_gqa_eager_attention_forward(
     self: nn.Module,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -66,19 +66,19 @@ def myminimind_gqa_eager_attention_forward(
     return output, attn_score
 
 
-ALL_ATTENTION_FUNCTIONS.register("my_gqa", myminimind_gqa_eager_attention_forward)
-ALL_MASK_ATTENTION_FUNCTIONS.register("my_gqa", eager_mask)
+ALL_ATTENTION_FUNCTIONS.register("mini_deepseek_gqa", mini_deepseek_gqa_eager_attention_forward)
+ALL_MASK_ATTENTION_FUNCTIONS.register("mini_deepseek_gqa", eager_mask)
 
 
-def myminimind_mla_attention_forward(*args, **kwargs):
-    raise NotImplementedError("MyMLA handles attention internally and should not dispatch through ALL_ATTENTION_FUNCTIONS.")
+def mini_deepseek_mla_attention_forward(*args, **kwargs):
+    raise NotImplementedError("MiniDeepSeekMLA handles attention internally and should not dispatch through ALL_ATTENTION_FUNCTIONS.")
 
 
-ALL_ATTENTION_FUNCTIONS.register("my_mla", myminimind_mla_attention_forward)
-ALL_MASK_ATTENTION_FUNCTIONS.register("my_mla", eager_mask)
+ALL_ATTENTION_FUNCTIONS.register("mini_deepseek_mla", mini_deepseek_mla_attention_forward)
+ALL_MASK_ATTENTION_FUNCTIONS.register("mini_deepseek_mla", eager_mask)
 
 
-class MyBaseModelOutputWithPast(BaseModelOutputWithPast):
+class MiniDeepSeekBaseModelOutputWithPast(BaseModelOutputWithPast):
     aux_loss: torch.Tensor | None = None
 
     def __init__(
@@ -92,7 +92,7 @@ class MyBaseModelOutputWithPast(BaseModelOutputWithPast):
         self.mtp_hidden_states = mtp_hidden_states
 
 
-class MyCausalLMOutputWithPast(CausalLMOutputWithPast):
+class MiniDeepSeekCausalLMOutputWithPast(CausalLMOutputWithPast):
     aux_loss: torch.Tensor | None = None
 
     def __init__(
@@ -107,7 +107,7 @@ class MyCausalLMOutputWithPast(CausalLMOutputWithPast):
 class GroupQueryAttention(nn.Module):
     def __init__(
         self,
-        config: MyMiniMindConfig,
+        config: MiniDeepSeekConfig,
         layer_idx: int,
     ):
         super().__init__()
@@ -206,8 +206,8 @@ class GroupQueryAttention(nn.Module):
         return output
 
 
-class MyMLA(nn.Module):
-    def __init__(self, config: MyMiniMindConfig, layer_idx: int):
+class MiniDeepSeekMLA(nn.Module):
+    def __init__(self, config: MiniDeepSeekConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -350,18 +350,18 @@ class MyMLA(nn.Module):
         return x
 
 
-def build_attention_layer(config: MyMiniMindConfig, layer_idx: int) -> nn.Module:
+def build_attention_layer(config: MiniDeepSeekConfig, layer_idx: int) -> nn.Module:
     attention_type = getattr(config, "attention_type", "gqa")
     if attention_type == "gqa":
         return GroupQueryAttention(config, layer_idx)
     if attention_type == "mla":
         # return MultiHeadLatentAttention(config, layer_idx)
-        return MyMLA(config, layer_idx)
+        return MiniDeepSeekMLA(config, layer_idx)
     raise ValueError(f"Unsupported attention_type={attention_type!r}.")
 
 
 class GLU_FFN(nn.Module):
-    def __init__(self, config: MyMiniMindConfig):
+    def __init__(self, config: MiniDeepSeekConfig):
         super().__init__()
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
@@ -375,7 +375,7 @@ class GLU_FFN(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config: MyMiniMindConfig):
+    def __init__(self, config: MiniDeepSeekConfig):
         super().__init__()
         self.glu_ffn = GLU_FFN(config)
 
@@ -385,7 +385,7 @@ class FeedForward(nn.Module):
 
 
 class MoEGate(nn.Module):
-    def __init__(self, config: MyMiniMindConfig):
+    def __init__(self, config: MiniDeepSeekConfig):
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_token
@@ -465,8 +465,8 @@ class MoEGate(nn.Module):
 
 
 @use_experts_implementation
-class MyMiniMindExperts(nn.ModuleList):
-    def __init__(self, config: MyMiniMindConfig):
+class MiniDeepSeekExperts(nn.ModuleList):
+    def __init__(self, config: MiniDeepSeekConfig):
         super().__init__([GLU_FFN(config) for _ in range(config.num_routed_experts)])
         self.num_experts = config.num_routed_experts
 
@@ -509,10 +509,10 @@ class MyMiniMindExperts(nn.ModuleList):
 
 
 class MoEFeedForward(nn.Module):
-    def __init__(self, config: MyMiniMindConfig):
+    def __init__(self, config: MiniDeepSeekConfig):
         super().__init__()
         self.config = config
-        self.experts = MyMiniMindExperts(config)
+        self.experts = MiniDeepSeekExperts(config)
         self.gate = MoEGate(config)
         self.shared_experts = nn.ModuleList([GLU_FFN(config) for _ in range(config.num_shared_experts)])
         self.capacity_factor = config.capacity_factor
@@ -584,10 +584,10 @@ class MoEFeedForward(nn.Module):
         return y, self.aux_loss
 
 
-class MyMiniMindDecoderLayer(nn.Module):
+class MiniDeepSeekDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: MyMiniMindConfig,
+        config: MiniDeepSeekConfig,
         layer_idx: int,
     ):
         super().__init__()
@@ -621,8 +621,8 @@ class MyMiniMindDecoderLayer(nn.Module):
         return hidden_states, aux_loss
 
 
-class MyMiniMindMTPModule(nn.Module):
-    def __init__(self, config: MyMiniMindConfig, mtp_module_idx: int, max_main_model_layer_idx: int):
+class MiniDeepSeekMTPModule(nn.Module):
+    def __init__(self, config: MiniDeepSeekConfig, mtp_module_idx: int, max_main_model_layer_idx: int):
         super().__init__()
         self.config = config
         # mtp_module_idx >= 1
@@ -633,7 +633,7 @@ class MyMiniMindMTPModule(nn.Module):
         self.embed_dropout = nn.Dropout(config.dropout)
         self.mtp_layernorm = build_norm(config, hidden_size=config.hidden_size * 2, eps=config.rms_norm_eps)
         self.linear_proj = nn.Linear(config.hidden_size * 2, config.hidden_size)
-        self.decoder_layer = MyMiniMindDecoderLayer(config, layer_idx=self.layer_idx)
+        self.decoder_layer = MiniDeepSeekDecoderLayer(config, layer_idx=self.layer_idx)
     
     def forward(
         self, 
@@ -677,12 +677,12 @@ class MyMiniMindMTPModule(nn.Module):
         return output_hidden_states, layer_aux_loss
 
 
-class MyMinimindPreTrainedModel(PreTrainedModel):
-    config: MyMiniMindConfig
-    config_class = MyMiniMindConfig
+class MiniDeepSeekPreTrainedModel(PreTrainedModel):
+    config: MiniDeepSeekConfig
+    config_class = MiniDeepSeekConfig
     base_model_prefix = "model"
     main_input_name = "input_ids"
-    _no_split_modules = ["MyMiniMindDecoderLayer"]
+    _no_split_modules = ["MiniDeepSeekDecoderLayer"]
 
     def get_correct_experts_implementation(self, requested_experts: str | None) -> str:
         requested_experts = "eager" if requested_experts is None else requested_experts
@@ -699,10 +699,10 @@ class MyMinimindPreTrainedModel(PreTrainedModel):
         return parent_getter(self, requested_experts)
 
 
-class MyMiniMindModel(MyMinimindPreTrainedModel):
+class MiniDeepSeekModel(MiniDeepSeekPreTrainedModel):
     _supports_attention_backend = True
 
-    def __init__(self, config: MyMiniMindConfig):
+    def __init__(self, config: MiniDeepSeekConfig):
         super().__init__(config)
         self.config = config
         self.vocab_size = config.vocab_size
@@ -710,7 +710,7 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
         self.embed_tokens = nn.Embedding(self.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
 
-        self.layers = nn.ModuleList([MyMiniMindDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([MiniDeepSeekDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = build_norm(config, hidden_size=config.hidden_size, eps=config.rms_norm_eps)
 
         dim = self._get_rope_dim()
@@ -719,7 +719,7 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
         self.mtp_level = config.mtp_level
         if self.mtp_level > 0 and not self.training:
             raise ValueError("MTP modules are only for training and should not be used during inference")
-        self.mtp_layers = nn.ModuleList([MyMiniMindMTPModule(config, mtp_module_idx=i, max_main_model_layer_idx=self.num_hidden_layers - 1) for i in range(1, config.mtp_level + 1)])
+        self.mtp_layers = nn.ModuleList([MiniDeepSeekMTPModule(config, mtp_module_idx=i, max_main_model_layer_idx=self.num_hidden_layers - 1) for i in range(1, config.mtp_level + 1)])
         
         self.post_init()
 
@@ -749,7 +749,7 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
         use_cache: bool = False,
         return_dict: bool | None = None,
         **kwargs,
-    ) -> MyBaseModelOutputWithPast | tuple[torch.Tensor, Cache | None, torch.Tensor]:
+    ) -> MiniDeepSeekBaseModelOutputWithPast | tuple[torch.Tensor, Cache | None, torch.Tensor]:
         # input_ids.shape == (batch_size, seq_len)
         if (input_ids is None) ^ (input_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or input_embeds")
@@ -842,7 +842,7 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
         if not return_dict:
             return mtp_hidden_states, past_key_values, aux_loss
 
-        return MyBaseModelOutputWithPast(
+        return MiniDeepSeekBaseModelOutputWithPast(
             last_hidden_state=mtp_hidden_states[0],
             past_key_values=past_key_values,
             aux_loss=aux_loss,
@@ -850,14 +850,14 @@ class MyMiniMindModel(MyMinimindPreTrainedModel):
         )
 
 
-class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
-    config_class = MyMiniMindConfig
+class MiniDeepSeekForCausalLM(MiniDeepSeekPreTrainedModel, GenerationMixin):
+    config_class = MiniDeepSeekConfig
     _supports_attention_backend = True
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config: MyMiniMindConfig):
+    def __init__(self, config: MiniDeepSeekConfig):
         super().__init__(config)
-        self.model = MyMiniMindModel(config)
+        self.model = MiniDeepSeekModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.linear_cross_entropy = build_linear_cross_entropy(config, ignore_index=-100)
         
@@ -954,9 +954,9 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
 
     def forward(
         self, input_ids: torch.Tensor | None = None, attention_mask: torch.Tensor | None = None, labels: torch.Tensor | None = None, past_key_values: list[tuple[torch.Tensor, torch.Tensor]] | None = None, use_cache: bool = False, logits_to_keep: int | torch.Tensor = 0, return_dict: bool | None = None, **kwargs
-    ) -> MyCausalLMOutputWithPast | tuple:
+    ) -> MiniDeepSeekCausalLMOutputWithPast | tuple:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        model_outputs: tuple | MyBaseModelOutputWithPast = self.model(
+        model_outputs: tuple | MiniDeepSeekBaseModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -965,7 +965,7 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
             **kwargs,
         )
         if return_dict:
-            assert isinstance(model_outputs, MyBaseModelOutputWithPast)
+            assert isinstance(model_outputs, MiniDeepSeekBaseModelOutputWithPast)
             hidden_states = model_outputs.mtp_hidden_states
             aux_loss = model_outputs.aux_loss
             present_key_values = model_outputs.past_key_values
@@ -985,20 +985,20 @@ class MyMiniMindForCausalLM(MyMinimindPreTrainedModel, GenerationMixin):
             output = (logits, present_key_values, hidden_states, aux_loss)
             return ((loss,) + output) if loss is not None else output
 
-        output = MyCausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=present_key_values, hidden_states=hidden_states)
+        output = MiniDeepSeekCausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=present_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
 
         return output
 
 
-def register_myminimind_for_auto_class() -> None:
+def register_mini_deepseek_for_auto_class() -> None:
     """Enable save_pretrained to emit auto_map metadata for custom-code loading."""
-    if getattr(MyMiniMindConfig, "_auto_class", None) is None:
-        MyMiniMindConfig.register_for_auto_class()
-    if getattr(MyMiniMindModel, "_auto_class", None) is None:
-        MyMiniMindModel.register_for_auto_class("AutoModel")
-    if getattr(MyMiniMindForCausalLM, "_auto_class", None) is None:
-        MyMiniMindForCausalLM.register_for_auto_class("AutoModelForCausalLM")
+    if getattr(MiniDeepSeekConfig, "_auto_class", None) is None:
+        MiniDeepSeekConfig.register_for_auto_class()
+    if getattr(MiniDeepSeekModel, "_auto_class", None) is None:
+        MiniDeepSeekModel.register_for_auto_class("AutoModel")
+    if getattr(MiniDeepSeekForCausalLM, "_auto_class", None) is None:
+        MiniDeepSeekForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 
 
 __all__ = [
@@ -1008,17 +1008,17 @@ __all__ = [
     "LayerNorm",
     "MoEFeedForward",
     "MoEGate",
-    "MyBaseModelOutputWithPast",
-    "MyCausalLMOutputWithPast",
-    "MyMiniMindDecoderLayer",
-    "MyMiniMindExperts",
-    "MyMiniMindForCausalLM",
-    "MyMiniMindModel",
-    "MyMinimindPreTrainedModel",
+    "MiniDeepSeekBaseModelOutputWithPast",
+    "MiniDeepSeekCausalLMOutputWithPast",
+    "MiniDeepSeekDecoderLayer",
+    "MiniDeepSeekExperts",
+    "MiniDeepSeekForCausalLM",
+    "MiniDeepSeekModel",
+    "MiniDeepSeekPreTrainedModel",
     "RMSNorm",
     "RotaryEmbedding",
     "apply_rotary_pos_emb_interleave",
     "build_norm",
     "build_apply_rotary_pos_emb",
-    "register_myminimind_for_auto_class",
+    "register_mini_deepseek_for_auto_class",
 ]

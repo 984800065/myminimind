@@ -4,22 +4,22 @@ from typing import Any
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BatchEncoding, TextStreamer
 
-from myminimind.config import get_infer_config
-from myminimind.config.schema import InferConfig
-from myminimind.model.configuration_myminimind import MyMiniMindConfig, load_myminimind_config
-from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM
-from myminimind.utils.train_utils import get_model_params, get_model_weight_path, load_tokenizer, setup_seed, sync_lm_config_with_tokenizer
+from mini_deepseek.config import get_infer_config
+from mini_deepseek.config.schema import InferConfig
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig, load_mini_deepseek_config
+from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekForCausalLM
+from mini_deepseek.utils.train_utils import get_model_params, get_model_weight_path, load_tokenizer, setup_seed, sync_lm_config_with_tokenizer
 
 
 def _checkpoint_path(infer_cfg: InferConfig) -> str:
     return get_model_weight_path(infer_cfg)
 
 
-def _resolve_model_config(infer_cfg: InferConfig, tokenizer) -> MyMiniMindConfig:
+def _resolve_model_config(infer_cfg: InferConfig, tokenizer) -> MiniDeepSeekConfig:
     if infer_cfg.model_config_path:
-        model_config = load_myminimind_config(infer_cfg.model_config_path)
+        model_config = load_mini_deepseek_config(infer_cfg.model_config_path)
     else:
-        model_config = MyMiniMindConfig(**infer_cfg.to_lm_config_kwargs())
+        model_config = MiniDeepSeekConfig(**infer_cfg.to_lm_config_kwargs())
     return sync_lm_config_with_tokenizer(model_config, tokenizer)
 
 
@@ -27,7 +27,7 @@ def init_model(infer_cfg: InferConfig) -> tuple[Any, Any]:
     if infer_cfg.hf_model_dir:
         tokenizer = AutoTokenizer.from_pretrained(infer_cfg.hf_model_dir, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(infer_cfg.hf_model_dir, trust_remote_code=True)
-        if isinstance(model.config, MyMiniMindConfig):
+        if isinstance(model.config, MiniDeepSeekConfig):
             get_model_params(model, model.config)
         model = model.to(infer_cfg.device)
         model.eval()
@@ -35,7 +35,7 @@ def init_model(infer_cfg: InferConfig) -> tuple[Any, Any]:
 
     tokenizer = load_tokenizer(infer_cfg.tokenizer_path)
     model_config = _resolve_model_config(infer_cfg, tokenizer)
-    model = MyMiniMindForCausalLM(model_config)
+    model = MiniDeepSeekForCausalLM(model_config)
     ckpt = _checkpoint_path(infer_cfg)
     model.load_state_dict(torch.load(ckpt, map_location=infer_cfg.device), strict=True)
 

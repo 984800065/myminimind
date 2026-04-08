@@ -1,5 +1,5 @@
 """
-MiniMind GRPO 训练入口：get_grpo_config() 加载参数，DDP + 混合精度 + swanlab。
+MiniDeepSeek GRPO 训练入口：get_grpo_config() 加载参数，DDP + 混合精度 + swanlab。
 """
 
 import os
@@ -16,13 +16,14 @@ from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 from transformers import AutoModel, AutoTokenizer
 
-from myminimind.config import GRPOConfig, get_grpo_config
-from myminimind.data import RLAIFDataset
-from myminimind.model.configuration_myminimind import MyMiniMindConfig as MiniMindConfig
-from myminimind.model.modeling_myminimind import MyMiniMindForCausalLM as MiniMindForCausalLM
-from myminimind.utils.logger import logger
-from myminimind.utils.train_utils import (
+from mini_deepseek.config import GRPOConfig, get_grpo_config
+from mini_deepseek.data import RLAIFDataset
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
+from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekForCausalLM
+from mini_deepseek.utils.logger import logger
+from mini_deepseek.utils.train_utils import (
     SkipBatchSampler,
+    get_swanlab_experiment_name,
     init_distributed,
     init_model,
     is_main_process,
@@ -121,15 +122,15 @@ def grpo_train_epoch(
     epoch: int,
     loader: DataLoader,
     total_iters: int,
-    model: MiniMindForCausalLM,
-    ref_model: MiniMindForCausalLM,
+    model: MiniDeepSeekForCausalLM,
+    ref_model: MiniDeepSeekForCausalLM,
     reward_model,
     reward_tokenizer,
     tokenizer: AutoTokenizer,
     optimizer: optim.AdamW,
     scheduler: CosineAnnealingLR,
     autocast_ctx,
-    lm_config: MiniMindConfig,
+    lm_config: MiniDeepSeekConfig,
     zero_based_start_step: int = 0,
     swanlab_: swanlab.Run | None = None,
 ) -> None:
@@ -158,7 +159,7 @@ def grpo_train_epoch(
         completion_ids = outputs[:, prompt_inputs["input_ids"].size(1) :]
 
         def get_per_tokne_logps(
-            model: MiniMindForCausalLM,
+            model: MiniDeepSeekForCausalLM,
             input_ids: torch.Tensor,
             n_keep: int,
         ):
@@ -293,15 +294,15 @@ def grpo_train_epoch(
 
 def train(
     cfg: GRPOConfig,
-    model: MiniMindForCausalLM,
-    ref_model: MiniMindForCausalLM,
+    model: MiniDeepSeekForCausalLM,
+    ref_model: MiniDeepSeekForCausalLM,
     reward_model,
     reward_tokenizer,
     tokenizer: AutoTokenizer,
     optimizer: optim.AdamW,
     scheduler: CosineAnnealingLR,
     autocast_ctx,
-    lm_config: MiniMindConfig,
+    lm_config: MiniDeepSeekConfig,
     train_sampler: DistributedSampler | None,
     train_dataset: RLAIFDataset,
     last_end_epoch: int,
@@ -387,8 +388,7 @@ def main() -> None:
     if cfg.use_swanlab and is_main_process():
         swanlab_id = ckp_data.get("swanlab_id", None) if ckp_data else None
         resume = "must" if swanlab_id else None
-        model_name = f"MiniMind{cfg.hidden_size}{'_moe' if cfg.use_moe else ''}"
-        name = f"{model_name}-GRPO-E{cfg.epochs}-B{cfg.batch_size}-LR{cfg.learning_rate}"
+        name = get_swanlab_experiment_name(cfg)
         swanlab.init(project=cfg.swanlab_project, name=name, id=swanlab_id, resume=resume)
         swanlab_ = swanlab
 

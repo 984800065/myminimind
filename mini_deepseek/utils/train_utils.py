@@ -10,15 +10,17 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 
-from myminimind.config.schema import BaseConfig, InferConfig, TrainConfig
-from myminimind.model.configuration_myminimind import MyMiniMindConfig
-from myminimind.model.modular_myminimind import MyMiniMindForCausalLM
-from myminimind.utils.logger import logger
+from mini_deepseek.config.schema import BaseConfig, InferConfig, TrainConfig
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
+from mini_deepseek.model.modular_mini_deepseek import MiniDeepSeekForCausalLM
+from mini_deepseek.utils.logger import logger
+
+PROJECT_MODEL_NAME = "mini_deepseek"
 
 
-def get_universial_name(cfg: TrainConfig | InferConfig, weight: str | None = None) -> str:
+def get_universal_name(cfg: TrainConfig | InferConfig, weight: str | None = None) -> str:
     """
-    universial file name without file type suffix
+    universal file name without file type suffix
 
     pattern: <save_weight>_<hidden_size>_moe-<moe_type>_attn-<attention_type>
     """
@@ -33,12 +35,48 @@ def get_universial_name(cfg: TrainConfig | InferConfig, weight: str | None = Non
     return weight_file_name
 
 
-def get_universial_save_path(cfg: TrainConfig | InferConfig, universial_file_name: str) -> str:
+def get_universal_save_path(cfg: TrainConfig | InferConfig, universal_file_name: str) -> str:
     """
-    save_dir pattern: <save_dir>/<universial_file_name>
+    save_dir pattern: <save_dir>/<universal_file_name>
     """
     save_dir = cfg.save_dir
-    return os.path.join(save_dir, universial_file_name)
+    return os.path.join(save_dir, universal_file_name)
+
+
+def build_swanlab_experiment_name(
+    *,
+    project_model_name: str,
+    universal_name: str,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+) -> str:
+    """Build a consistent SwanLab run name for all training entrypoints."""
+
+    return (
+        f"{project_model_name}_{universal_name}"
+        f"_E{epochs}"
+        f"_B{batch_size}"
+        f"_LR{learning_rate}"
+    )
+
+
+def get_swanlab_experiment_name(
+    cfg: TrainConfig,
+    *,
+    project_model_name: str = PROJECT_MODEL_NAME,
+    weight: str | None = None,
+) -> str:
+    """Build the SwanLab experiment name from the shared project naming rules."""
+
+    universal_name = get_universal_name(cfg, weight=weight)
+    return build_swanlab_experiment_name(
+        project_model_name=project_model_name,
+        universal_name=universal_name,
+        epochs=cfg.epochs,
+        batch_size=cfg.batch_size,
+        learning_rate=cfg.learning_rate,
+    )
 
 
 def get_model_weight_path(
@@ -50,18 +88,18 @@ def get_model_weight_path(
     """
     Build the raw model weight path used by training/eval/export scripts.
 
-    pattern: <save_dir>/<universial_file_name>[_debug].pth
+    pattern: <save_dir>/<universal_file_name>[_debug].pth
     """
     if include_debug is None:
         include_debug = isinstance(cfg, TrainConfig) and cfg.debug
 
-    weight_file_name = get_universial_name(cfg, weight=weight)
+    weight_file_name = get_universal_name(cfg, weight=weight)
 
     if include_debug:
         weight_file_name = weight_file_name + "_debug"
 
     weight_file_name = weight_file_name + ".pth"
-    path = get_universial_save_path(cfg, weight_file_name)
+    path = get_universal_save_path(cfg, weight_file_name)
     return path
 
 
@@ -73,11 +111,11 @@ def get_resume_weight_path(cfg: TrainConfig, *, weight: str | None = None) -> st
     - `*.pth`: raw model parameters, convenient for inference/export
     - `*_resume.pth`: optimizer/scaler/scheduler/step metadata for training resume
     """
-    resume_file_name = get_universial_name(cfg, weight=weight)
+    resume_file_name = get_universal_name(cfg, weight=weight)
     if cfg.debug:
         resume_file_name = resume_file_name + "_debug"
     resume_file_name = resume_file_name + "_resume.pth"
-    return get_universial_save_path(cfg, resume_file_name)
+    return get_universal_save_path(cfg, resume_file_name)
 
 
 def init_distributed(use_deepspeed: bool = False) -> int:
@@ -293,7 +331,7 @@ def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def get_model_params(model: MyMiniMindForCausalLM, config: MyMiniMindConfig):
+def get_model_params(model: MiniDeepSeekForCausalLM, config: MiniDeepSeekConfig):
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, "num_routed_experts", getattr(config, "num_experts", 0))
     n_active = getattr(config, "num_experts_per_token", 0)
@@ -318,7 +356,7 @@ def load_tokenizer(tokenizer_path: str) -> AutoTokenizer:
     return tokenizer
 
 
-def sync_lm_config_with_tokenizer(lm_config: MyMiniMindConfig, tokenizer: AutoTokenizer) -> MyMiniMindConfig:
+def sync_lm_config_with_tokenizer(lm_config: MiniDeepSeekConfig, tokenizer: AutoTokenizer) -> MiniDeepSeekConfig:
     lm_config.vocab_size = len(tokenizer)
     lm_config.bos_token_id = tokenizer.bos_token_id
     lm_config.eos_token_id = tokenizer.eos_token_id
@@ -326,22 +364,22 @@ def sync_lm_config_with_tokenizer(lm_config: MyMiniMindConfig, tokenizer: AutoTo
     return lm_config
 
 
-def resolve_lm_config_and_tokenizer(cfg: BaseConfig) -> tuple[MyMiniMindConfig, AutoTokenizer]:
+def resolve_lm_config_and_tokenizer(cfg: BaseConfig) -> tuple[MiniDeepSeekConfig, AutoTokenizer]:
     """Build the LM config from training/infer config and sync tokenizer metadata."""
     lm_config_kwargs: dict = cfg.to_lm_config_kwargs()
     tokenizer = load_tokenizer(cfg.tokenizer_path)
-    lm_config = MyMiniMindConfig(**lm_config_kwargs)
+    lm_config = MiniDeepSeekConfig(**lm_config_kwargs)
     sync_lm_config_with_tokenizer(lm_config, tokenizer)
     return lm_config, tokenizer
 
 
 def init_model(
     cfg: TrainConfig,
-    lm_config: MyMiniMindConfig,
+    lm_config: MiniDeepSeekConfig,
     tokenizer: AutoTokenizer | None = None,
     *,
     from_weight: str | None = None,
-) -> tuple[MyMiniMindForCausalLM, AutoTokenizer]:
+) -> tuple[MiniDeepSeekForCausalLM, AutoTokenizer]:
     """
     Initialize a trainable model and optionally load raw `.pth` weights.
 
@@ -349,7 +387,7 @@ def init_model(
     source checkpoint name without mutating `cfg.save_weight`.
     """
     tokenizer = tokenizer if tokenizer is not None else load_tokenizer(cfg.tokenizer_path)
-    model = MyMiniMindForCausalLM(lm_config)
+    model = MiniDeepSeekForCausalLM(lm_config)
 
     source_weight = cfg.from_weight if from_weight is None else from_weight
     if source_weight != "none":

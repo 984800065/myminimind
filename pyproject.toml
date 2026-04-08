@@ -3,9 +3,9 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "myminimind"
+name = "mini_deepseek"
 version = "0.1.0"
-description = "MyMinimind: MiniMind 模型与训练"
+description = "MiniDeepSeek: MiniDeepSeek 模型与训练"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -53,7 +53,7 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["myminimind*"]
+include = ["mini_deepseek*"]
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

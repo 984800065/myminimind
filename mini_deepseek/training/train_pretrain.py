@@ -1,11 +1,12 @@
 """
-MiniMind On-policy 白盒蒸馏入口：get_distillation_config() 加载参数，DDP + 混合精度 + swanlab。
+MiniDeepSeek 预训练入口：get_pretrain_config() 加载参数，DDP + 混合精度 + swanlab。
 """
 
 import os
 import time
 from contextlib import nullcontext
 
+import deepspeed
 import swanlab
 import torch
 import torch.distributed as dist
@@ -14,18 +15,22 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 
-from myminimind.config import DistillationConfig, get_distillation_config
-from myminimind.data import SFTDataset
-from myminimind.model.configuration_myminimind import MyMiniMindConfig as MiniMindConfig
-from myminimind.model.modeling_myminimind import (
-    MyCausalLMOutputWithPast as CausalLMOutputWithPast,
+from mini_deepseek.config import PretrainConfig, get_pretrain_config
+from mini_deepseek.data import PretrainDataset
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
+from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekCausalLMOutputWithPast, MiniDeepSeekForCausalLM
+from mini_deepseek.utils.deepspeed_utils import (
+    load_deepspeed_engine_checkpoint,
+    load_deepspeed_resume_metadata,
+    resolve_deepspeed_config,
+    save_deepspeed_checkpoint,
+    save_resolved_deepspeed_config,
 )
-from myminimind.model.modeling_myminimind import (
-    MyMiniMindForCausalLM as MiniMindForCausalLM,
-)
-from myminimind.utils.logger import logger
-from myminimind.utils.train_utils import (
+from mini_deepseek.utils.logger import logger
+from mini_deepseek.utils.train_utils import (
     SkipBatchSampler,
+    get_model_weight_path,
+    get_swanlab_experiment_name,
     init_distributed,
     init_model,
     is_main_process,
@@ -37,15 +42,15 @@ from myminimind.utils.train_utils import (
 
 
 def train_epoch(
-    cfg: DistillationConfig,
+    cfg: PretrainConfig,
     epoch: int,
     loader: DataLoader,
-    model: MiniMindForCausalLM,
-    optimizer: optim.AdamW,
-    lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    scaler: torch.amp.GradScaler,
-    autocast_ctx: nullcontext | torch.amp.autocast,
-    lm_config: MiniMindConfig,
+    model: DistributedDataParallel | deepspeed.DeepSpeedEngine,
+    optimizer: optim.Optimizer,
+    lr_scheduler: optim.lr_scheduler.LRScheduler,
+    scaler: torch.GradScaler | None,
+    autocast_ctx: nullcontext | torch.autocast,
+    lm_config: MiniDeepSeekConfig,
     start_step: int = 0,
     swanlab_: swanlab.Run | None = None,
 ) -> None:
@@ -55,7 +60,8 @@ def train_epoch(
     total_iters = len(loader) + start_step
     pbar = tqdm(loader, total=total_iters, initial=start_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
 
-    optimizer.zero_grad(set_to_none=True)
+    if not cfg.use_deepspeed:
+        optimizer.zero_grad(set_to_none=True)
 
     epoch_avg_loss = 0.0
     epoch_avg_aux_loss = 0.0
@@ -67,35 +73,48 @@ def train_epoch(
         labels = labels.to(cfg.device)
 
         with autocast_ctx:
-            res: CausalLMOutputWithPast = model(input_ids=input_ids, labels=labels)
-            loss: torch.Tensor = res.loss + res.aux_loss
+
+            res: MiniDeepSeekCausalLMOutputWithPast = model(input_ids=input_ids, labels=labels)
+            assert res.loss is not None, "模型前向传播未返回loss"
+            if res.aux_loss is None:
+                loss = res.loss
+            else:
+                loss: torch.Tensor = res.loss + res.aux_loss
+                
             cur_loss = loss.item()
             cur_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
 
-            loss = loss / cfg.accumulation_steps
+            if not cfg.use_deepspeed:
+                loss = loss / cfg.accumulation_steps
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
             cur_step += 1
             pbar.set_postfix({"batch_loss": cur_loss, "epoch_avg_loss": epoch_avg_loss / cur_step, "batch_aux_loss": cur_aux_loss, "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step})
 
-        # 累计梯度
-        scaler.scale(loss).backward()
+        if cfg.use_deepspeed:
+            assert isinstance(model, deepspeed.DeepSpeedEngine), "启用 DeepSpeed 时，模型应为 DeepSpeedEngine 实例"
+            model.backward(loss)
+            model.step()
+        else:
+            assert scaler is not None, "非 DeepSpeed 模式下 scaler 不应为空"
+            scaler.scale(loss).backward()
 
-        # 只在真正发生参数更新时推进 scheduler；
-        # epoch 末尾不足 accumulation_steps 的剩余梯度也要补一次更新。
-        should_update = ((step + 1) % cfg.accumulation_steps == 0) or (step == total_iters - 1)
-        if should_update:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-            lr_scheduler.step()
+            # 只在真正发生参数更新时推进 scheduler；
+            # epoch 末尾不足 accumulation_steps 的剩余梯度也要补一次更新。
+            should_update = ((step + 1) % cfg.accumulation_steps == 0) or (step == total_iters - 1)
+            if should_update:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                lr_scheduler.step()
 
+        # logging
         if step % cfg.log_interval == 0 or step == total_iters - 1:
             spend_time = time.time() - start_time
             cur_logits_loss = cur_loss - cur_aux_loss
-            current_lr = lr_scheduler.get_last_lr()[0]
+            current_lr = optimizer.param_groups[0]["lr"]
             eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
             log_swanlab_training_metrics(
                 swanlab_,
@@ -113,33 +132,52 @@ def train_epoch(
                 },
             )
 
-        if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
+        # ckpt save
+        if (step + 1) % cfg.save_interval == 0 or step == total_iters - 1:
             model.eval()
-            lm_checkpoint(
-                cfg=cfg,
-                model=model,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-                scaler=scaler,
-                epoch=epoch,
-                step=step,
-                swanlab_=swanlab_,
-            )
+            
+            # if cfg.save_dir is a relative path, it is relative as-is. Otherwise, cfg.save_dir ans this are both absolute path.
+            check_point_path: str = get_model_weight_path(cfg)
+
+            if cfg.use_deepspeed:
+                raw_model = model.module if cfg.use_deepspeed or isinstance(model, DistributedDataParallel) else model
+                raw_model = getattr(raw_model, "_orig_mod", raw_model)
+                if is_main_process():
+                    torch.save(raw_model.state_dict(), check_point_path)
+                    logger.info(f"当前training step为 {step}，已保存模型权重到 {check_point_path}")
+                save_deepspeed_checkpoint(
+                    engine=model,
+                    epoch=epoch,
+                    step=step,
+                    swanlab_=swanlab_,
+                    cfg=cfg,
+                )
+            elif is_main_process():
+                lm_checkpoint(
+                    cfg=cfg,
+                    model=model,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    step=step,
+                    swanlab_=swanlab_,
+                )
             model.train()
 
         del input_ids, labels, res, loss
 
 
 def train(
-    cfg: DistillationConfig,
-    model: MiniMindForCausalLM,
+    cfg: PretrainConfig,
+    model: MiniDeepSeekForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
-    scaler: torch.amp.GradScaler,
+    scaler: torch.GradScaler,
     autocast_ctx,
-    lm_config: MiniMindConfig,
+    lm_config: MiniDeepSeekConfig,
     train_sampler: DistributedSampler | None,
-    train_dataset: SFTDataset,
+    train_dataset: PretrainDataset,
     last_end_epoch: int,
     last_end_step: int,
     swanlab_=None,
@@ -168,31 +206,39 @@ def train(
 
 
 def main():
-    cfg = get_distillation_config()
+    cfg = get_pretrain_config()
+    if cfg.use_deepspeed and cfg.use_compile:
+        raise ValueError("当前预训练入口暂不建议同时启用 DeepSpeed 与 torch.compile，请先关闭其中一个。")
 
     # ========== 1. 初始化环境和随机种子 ==========
-    local_rank = init_distributed()
+    local_rank = init_distributed(use_deepspeed=cfg.use_deepspeed)
     if dist.is_initialized():
         cfg.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
-    # ========== 2. 配置目录、模型参数、检查ckp ==========
-    os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg)
-    ckp_data = lm_checkpoint(cfg) if cfg.from_resume else None
-
-    # ========== 3. 设置混合精度 ==========
+    # ========== 2. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in cfg.device else "cpu"
     dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
+    autocast_ctx = nullcontext() if (device_type == "cpu" or cfg.use_deepspeed) else torch.autocast(device_type=device_type, dtype=dtype)
+
+    # ========== 3. 配置目录、模型参数、检查ckp ==========
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg)
+    ckp_data = None
+    ds_resume_meta = None
+    if cfg.from_resume:
+        if cfg.use_deepspeed:
+            ds_resume_meta = load_deepspeed_resume_metadata(cfg)
+        else:
+            ckp_data = lm_checkpoint(cfg)
 
     # ========== 4. 配swanlab ==========
     swanlab_ = None
     if cfg.use_swanlab and is_main_process():
-        swanlab_id = ckp_data.get("swanlab_id", None) if ckp_data else None
+        resume_meta = ds_resume_meta if cfg.use_deepspeed else ckp_data
+        swanlab_id = resume_meta.get("swanlab_id", None) if resume_meta else None
         resume = "must" if swanlab_id else None
-        model_name = f"MiniMind{lm_config.hidden_size}{'_moe' if lm_config.use_moe else ''}"
-        name = f"{model_name}-Distill-E{cfg.epochs}-B{cfg.batch_size}-LR{cfg.learning_rate}"
+        name = get_swanlab_experiment_name(cfg)
         swanlab.init(project=cfg.swanlab_project, name=name, id=swanlab_id, resume=resume)
         swanlab_ = swanlab
 
@@ -206,30 +252,46 @@ def main():
         model = torch.compile(model)
         logger.info("torch.compile enabled")
 
-    train_dataset = SFTDataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
+    train_dataset = PretrainDataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
-    scaler = torch.amp.GradScaler(enabled=(cfg.dtype == "float16"))
+    scaler = None if cfg.use_deepspeed else torch.GradScaler(enabled=(cfg.dtype == "float16"))
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)
     cur_rank_total_samples = len(train_sampler) if train_sampler is not None else len(train_dataset)
     micro_batches_per_epoch = (cur_rank_total_samples + cfg.batch_size - 1) // cfg.batch_size
     update_steps_per_epoch = max(1, (micro_batches_per_epoch + cfg.accumulation_steps - 1) // cfg.accumulation_steps)
     lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs * update_steps_per_epoch, eta_min=0.1 * cfg.learning_rate)
 
+    if cfg.use_deepspeed:
+        ds_config = resolve_deepspeed_config(cfg)
+        save_resolved_deepspeed_config(ds_config, cfg)
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model,
+            model_parameters=model.parameters(),
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            config=ds_config,
+        )
+
     # ========== 6. 从ckp恢复状态 ==========
     last_end_epoch, last_end_step = 0, -1
-    if ckp_data is not None:
+    if cfg.use_deepspeed:
+        client_state = load_deepspeed_engine_checkpoint(model, cfg) if cfg.from_resume else None
+        if client_state is not None:
+            last_end_epoch = client_state.get("epoch", 0)
+            last_end_step = client_state.get("step", -1)
+    elif ckp_data is not None:
         model.load_state_dict(ckp_data["model"])
         optimizer.load_state_dict(ckp_data["optimizer"])
         if "lr_scheduler" in ckp_data:
             lr_scheduler.load_state_dict(ckp_data["lr_scheduler"])
+        assert scaler is not None
         scaler.load_state_dict(ckp_data["scaler"])
         last_end_epoch = ckp_data.get("epoch", 0)
         last_end_step = ckp_data.get("step", -1)
 
     # ========== 7. DDP包模型 ==========
-    if dist.is_initialized():
-        model._ddp_params_and_buffers_to_ignore = {"cos_phi", "sin_phi"}
-        model = DistributedDataParallel(model, device_ids=[local_rank])
+    if dist.is_initialized() and not cfg.use_deepspeed:
+        model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
 
     # ========== 8. 开始训练 ==========
     train(

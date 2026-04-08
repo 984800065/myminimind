@@ -2,7 +2,7 @@ import torch
 from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 from torch import nn
 
-from myminimind.model.configuration_myminimind import MyMiniMindConfig
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
 
 
 class LinearCrossEntropyBase(nn.Module):
@@ -67,7 +67,7 @@ class LigerLinearCrossEntropy(LinearCrossEntropyBase):
 
 
 def build_linear_cross_entropy(
-    config: MyMiniMindConfig,
+    config: MiniDeepSeekConfig,
     ignore_index: int = -100,
 ) -> LinearCrossEntropyBase:
     """Build the LM-head loss backend selected by config.
