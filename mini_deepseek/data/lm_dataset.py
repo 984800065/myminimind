@@ -79,6 +79,7 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset("json", data_files=file_path, split="train")
+        # TODO: 当前依赖特定 chat template 的角色字符串定位 assistant；后续重构数据读取时改用 tokenizer 原生 assistant mask 或逐消息 token 区间。
         self.bos_id: list[int] = tokenizer(f"{tokenizer.bos_token or ''}assistant\n", add_special_tokens=False).input_ids
         self.eos_id: list[int] = tokenizer(f"{tokenizer.eos_token or ''}\n", add_special_tokens=False).input_ids
 

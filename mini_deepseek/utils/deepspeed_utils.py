@@ -199,8 +199,8 @@ def resolve_deepspeed_config(cfg: TrainConfig) -> dict[str, Any]:
 
     Raises:
         ImportError: 外部配置为 YAML，但环境中未安装 `pyyaml`。
-        ValueError: 外部配置格式不受支持、公共训练字段冲突，或 ZeRO stage
-            不是 0、1、2。
+        ValueError: 外部配置格式不受支持、公共训练字段冲突、ZeRO stage
+            不是 0、1、2，或启用了尚未适配的 Tensor Parallel。
     """
     if cfg.deepspeed_config:
         ds_config = _load_json_or_yaml(cfg.deepspeed_config)
@@ -215,9 +215,21 @@ def resolve_deepspeed_config(cfg: TrainConfig) -> dict[str, Any]:
             f"（ZeRO-{cfg.deepspeed_zero_stage}, TP={cfg.deepspeed_tensor_parallel_size}）"
         )
 
-    zero_stage = ds_config.get("zero_optimization", {}).get("stage", cfg.deepspeed_zero_stage)
+    zero_config = ds_config.get("zero_optimization", {})
+    if not isinstance(zero_config, dict):
+        raise ValueError(f"DeepSpeed zero_optimization 配置必须是对象，实际为: {zero_config!r}")
+    zero_stage = zero_config.get("stage", cfg.deepspeed_zero_stage)
     if zero_stage not in (0, 1, 2):
-        raise ValueError(f"当前预训练入口只支持 DeepSpeed ZeRO stage 0/1/2，收到: {zero_stage}")
+        raise ValueError(f"当前训练入口只支持 DeepSpeed ZeRO stage 0/1/2，收到: {zero_stage}")
+    tensor_parallel_config = ds_config.get("tensor_parallel", {})
+    if not isinstance(tensor_parallel_config, dict):
+        raise ValueError(f"DeepSpeed tensor_parallel 配置必须是对象，实际为: {tensor_parallel_config!r}")
+    tensor_parallel_size = tensor_parallel_config.get("autotp_size", 1)
+    if tensor_parallel_size != 1:
+        raise ValueError(
+            "当前训练入口尚未适配 DeepSpeed Tensor Parallel，"
+            f"tensor_parallel.autotp_size 必须为 1，收到: {tensor_parallel_size}"
+        )
     return ds_config
 
 

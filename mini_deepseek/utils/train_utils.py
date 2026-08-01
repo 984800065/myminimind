@@ -12,11 +12,54 @@ from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 
 from mini_deepseek.config.schema import BaseConfig, InferConfig, TrainConfig
-from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
+from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig, load_mini_deepseek_config
 from mini_deepseek.model.modular_mini_deepseek import MiniDeepSeekForCausalLM
 from mini_deepseek.utils.logger import logger
 
 PROJECT_MODEL_NAME = "mini_deepseek"
+
+SFT_COMPATIBLE_MODEL_FIELDS = (
+    "vocab_size",
+    "bos_token_id",
+    "eos_token_id",
+    "pad_token_id",
+    "tie_word_embeddings",
+    "dropout",
+    "hidden_act",
+    "hidden_size",
+    "intermediate_size",
+    "num_attention_heads",
+    "num_hidden_layers",
+    "group_num",
+    "attention_type",
+    "mla_q_lora_rank",
+    "mla_kv_lora_rank",
+    "mla_qk_nope_head_dim",
+    "mla_qk_rope_head_dim",
+    "mla_v_head_dim",
+    "scale_fmt",
+    "rms_norm_eps",
+    "norm_implementation",
+    "rope_implementation",
+    "linear_cross_entropy_implementation",
+    "rope_theta",
+    "rope_scaling",
+    "original_max_position_embeddings",
+    "inference_rope_scaling",
+    "flash_attention",
+    "use_moe",
+    "num_experts_per_token",
+    "num_routed_experts",
+    "num_shared_experts",
+    "scoring_function",
+    "aux_loss_alpha",
+    "seq_aux",
+    "norm_topk_prob",
+    "capacity_factor",
+    "mtp_level",
+    "mtp_lambda",
+    "experts_implementation",
+)
 
 
 def get_universal_name(cfg: TrainConfig | InferConfig, weight: str | None = None) -> str:
@@ -247,7 +290,7 @@ def get_model_config_path(
         include_debug: 是否在权重文件名中添加 `_debug` 后缀。
 
     Returns:
-        模型结构 sidecar 文件的完整路径。
+        权重旁边同名的 `.config.json` 文件完整路径。
     """
     weight_path = get_model_weight_path(
         cfg,
@@ -255,6 +298,72 @@ def get_model_config_path(
         include_debug=include_debug,
     )
     return str(Path(weight_path).with_suffix(".config.json"))
+
+
+def validate_sft_model_config(
+    cfg: TrainConfig,
+    lm_config: MiniDeepSeekConfig,
+    *,
+    resume_available: bool,
+) -> None:
+    """
+    严格校验 SFT 配置与基础权重或 resume checkpoint 的模型配置。
+
+    SFT 可以调整上下文长度，因此不比较 `max_seq_len` 和
+    `max_position_embeddings`。其余会影响参数结构或前向语义的字段必须完全
+    一致。`init_model()` 使用 `strict=False` 加载权重，缺失或多出的参数名只会
+    记录告警，因此必须在加载前通过配置文件阻止错误结构继续训练。
+
+    Args:
+        cfg: 当前 SFT 运行配置。
+        lm_config: 根据当前 SFT 配置和 tokenizer 构建的模型配置。
+        resume_available: 是否已确认存在可恢复的 SFT checkpoint。
+
+    Returns:
+        None。
+
+    Raises:
+        FileNotFoundError: 对应权重旁缺少同名的 `.config.json` 文件。
+        ValueError: 当前 SFT 模型配置与 checkpoint 配置不一致。
+    """
+    if resume_available:
+        config_path = Path(get_model_config_path(cfg))
+        source_name = "SFT resume checkpoint"
+    elif cfg.from_weight != "none":
+        weight_path = Path(
+            resolve_model_weight_path(
+                cfg,
+                weight=cfg.from_weight,
+                include_debug=False,
+            )
+        )
+        config_path = weight_path.with_suffix(".config.json")
+        source_name = f"基础权重 {weight_path}"
+    else:
+        return
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"{source_name} 旁缺少同名的模型配置文件: {config_path}。"
+            "SFT 不允许在无法确认模型结构时加载权重。"
+        )
+
+    checkpoint_config = load_mini_deepseek_config(config_path)
+    mismatches: list[str] = []
+    for field in SFT_COMPATIBLE_MODEL_FIELDS:
+        checkpoint_value = getattr(checkpoint_config, field, None)
+        current_value = getattr(lm_config, field, None)
+        if checkpoint_value != current_value:
+            mismatches.append(
+                f"{field}: checkpoint={checkpoint_value!r}, SFT={current_value!r}"
+            )
+
+    if mismatches:
+        mismatch_text = "\n  - ".join(mismatches)
+        raise ValueError(
+            f"{source_name} 与当前 SFT 模型配置不兼容。请显式调整 SFT 配置，"
+            f"本入口不会自动覆盖模型结构：\n  - {mismatch_text}"
+        )
 
 
 def save_model_config(
@@ -265,7 +374,7 @@ def save_model_config(
     include_debug: bool | None = None,
 ) -> str:
     """
-    将模型结构配置原子写入原始权重旁的 sidecar 文件。
+    将模型结构配置原子写入权重旁同名的 `.config.json` 文件。
 
     先写入临时文件，再通过 `os.replace` 替换目标文件，避免进程中断后留下
     不完整的 JSON 配置。
@@ -514,7 +623,7 @@ def lm_checkpoint(
         cfg: 训练配置，提供 checkpoint 路径和运行参数。
         model: 待保存的模型；为 `None` 时表示加载 checkpoint。
         optimizer: 优化器；保存模式下将其 state dict 写入续训状态。
-        lm_config: 模型结构配置；提供时保存到权重旁的 sidecar 文件。
+        lm_config: 模型结构配置；提供时保存到权重旁同名的 `.config.json` 文件。
         epoch: 保存时所在的 epoch 索引。
         step: 保存时所在的 batch 索引。
         swanlab_: SwanLab 实验对象，用于持久化 run ID。

@@ -375,9 +375,10 @@ def _build_sft_parser() -> argparse.ArgumentParser:
     _add_device_dtype_parser_args(parser)
     _add_basic_data_parser_args(parser)
     _add_tokenizer_parser_args(parser)
-    _add_train_model_parser_args(parser)
+    _add_train_model_parser_args(parser, include_mtp=True)
     _add_resume_parser_args(parser)
     _add_experiment_parser_args(parser)
+    _add_deepspeed_parser_args(parser)
     return parser
 
 

@@ -307,6 +307,8 @@ def main():
     cfg: PretrainConfig = get_pretrain_config()
     if cfg.use_deepspeed and cfg.use_compile:
         raise ValueError("当前预训练入口暂不建议同时启用 DeepSpeed 与 torch.compile，请先关闭其中一个。")
+    if cfg.deepspeed_tensor_parallel_size != 1:
+        raise ValueError("当前预训练入口尚未适配 DeepSpeed Tensor Parallel，deepspeed_tensor_parallel_size 必须为 1。")
     if cfg.save_interval < cfg.accumulation_steps or cfg.save_interval % cfg.accumulation_steps != 0:
         raise ValueError("save_interval 必须大于等于 accumulation_steps，且必须是 accumulation_steps 的整数倍。")
 

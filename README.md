@@ -150,6 +150,13 @@ uv run python -m mini_deepseek.training.train_full_sft \
   --data-path ./dataset/sft.jsonl \
   --from-weight pretrain
 
+# Full SFT with DeepSpeed
+CUDA_VISIBLE_DEVICES=0,1 uv run deepspeed \
+  --module mini_deepseek.training.train_full_sft \
+  --use-deepspeed true \
+  --data-path ./dataset/sft.jsonl \
+  --from-weight pretrain
+
 # DPO
 uv run python -m mini_deepseek.training.train_dpo \
   --data-path ./dataset/dpo.jsonl \
@@ -163,6 +170,12 @@ uv run python -m mini_deepseek.training.train_distillation \
   --distill-alpha 0.5 \
   --distill-temperature 2.0
 ```
+
+Full SFT 的 DeepSpeed、梯度累积、checkpoint 和外部配置约束与预训练一致，当前同样仅支持 ZeRO Stage 0、1、2，且尚未适配 Tensor Parallel。
+
+本项目是用于学习和验证训练链路的 toy project。当前 `SFTDataset` 假设 tokenizer 的 chat template 使用固定的 assistant/EOS 角色边界，并通过手工 token 匹配生成监督标签；复杂多轮对话、用户正文包含角色标记及 tool call 模板尚未系统覆盖，后续会统一重构数据读取和 assistant mask。
+
+Full SFT 会强制读取基础权重或 resume checkpoint 旁的 `.config.json`，并严格校验模型结构、token、RoPE、MoE 和 MTP 配置；配置缺失或不一致时直接报错，不会静默覆盖。SFT 可以单独调整 `data_max_seq_len`，因此上下文长度不参与兼容性比较。
 
 权重名称会自动包含 hidden size、MoE 类型和 attention 类型。`--from-resume true` 用于恢复模型、优化器、学习率调度器和训练进度；`--from-weight` 只用于指定初始化模型权重。
 
