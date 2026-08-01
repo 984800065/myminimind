@@ -87,6 +87,7 @@ def train_epoch(
 
     # 加上 start_step 得到原 epoch 的完整 step 数，使进度条和日志在续训前后保持连续。
     total_iters = len(loader) + start_step
+    accumulation_steps = model.gradient_accumulation_steps() if cfg.use_deepspeed else cfg.accumulation_steps
     # tqdm 会在每个 batch 迭代时更新进度条，显示当前 step、总 step、耗时和预计剩余时间。
     pbar = tqdm(loader, total=total_iters, initial=start_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
 
@@ -101,6 +102,14 @@ def train_epoch(
     for step, (input_ids, labels) in enumerate(pbar, start=start_step):
         input_ids: torch.Tensor
         labels: torch.Tensor
+        window_start = (step // accumulation_steps) * accumulation_steps
+        accumulation_divisor = min(accumulation_steps, total_iters - window_start)
+        should_update = ((step + 1) % accumulation_steps == 0) or (step == total_iters - 1)
+
+        # DeepSpeed 默认按固定 GAS 判断更新边界，epoch 末尾不足一个窗口时需要显式强制更新。
+        if cfg.use_deepspeed:
+            assert isinstance(model, deepspeed.DeepSpeedEngine), "启用 DeepSpeed 时，模型应为 DeepSpeedEngine 实例"
+            model.set_gradient_accumulation_boundary(should_update)
 
         # 在分布式训练时，main() 函数在 init_distributed() 后按 LOCAL_RANK 设置 cfg.device，此处将当前 rank 的 batch 移到对应 GPU。如果没有分布式则使用 config 中指定的GPU设备。
         input_ids = input_ids.to(cfg.device)
@@ -121,13 +130,11 @@ def train_epoch(
             cur_loss = loss.item()
             cur_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
 
-            # 原生训练按当前累积窗口的实际 batch 数缩放 loss；DeepSpeed 会自行完成同等处理。
-            if not cfg.use_deepspeed:
-                window_start = (step // cfg.accumulation_steps) * cfg.accumulation_steps
-                accumulation_divisor = min(
-                    cfg.accumulation_steps,
-                    total_iters - window_start,
-                )
+            # 原生训练手动按实际窗口缩放 loss；DeepSpeed 默认按固定 GAS 缩放，尾部窗口需补偿为按实际 batch 数平均。
+            if cfg.use_deepspeed:
+                if accumulation_divisor < accumulation_steps:
+                    loss = loss * accumulation_steps / accumulation_divisor
+            else:
                 loss = loss / accumulation_divisor
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
@@ -136,7 +143,6 @@ def train_epoch(
 
         # DeepSpeedEngine 自行管理反向传播和累积边界；原生训练通过 GradScaler 执行反向传播。
         if cfg.use_deepspeed:
-            assert isinstance(model, deepspeed.DeepSpeedEngine), "启用 DeepSpeed 时，模型应为 DeepSpeedEngine 实例"
             model.backward(loss)
             model.step()
         else:
@@ -144,7 +150,6 @@ def train_epoch(
             scaler.scale(loss).backward()
 
             # 仅在完整累积窗口或 epoch 最后一个 batch 更新参数，并同步推进 scheduler。
-            should_update = ((step + 1) % cfg.accumulation_steps == 0) or (step == total_iters - 1)
             if should_update:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
@@ -157,9 +162,14 @@ def train_epoch(
         if step % cfg.log_interval == 0 or step == total_iters - 1:
             spend_time = time.time() - start_time
             cur_logits_loss = cur_loss - cur_aux_loss
+            if dist.is_initialized():
+                metrics = torch.tensor([cur_loss, cur_logits_loss, cur_aux_loss], device=cfg.device)
+                dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+                metrics /= dist.get_world_size()
+                cur_loss, cur_logits_loss, cur_aux_loss = metrics.tolist()
             current_lr = optimizer.param_groups[0]["lr"]
-            # 表示按当前平均 batch 耗时估算的本 epoch 剩余训练分钟数。
-            eta_minutes = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
+            # ETA 按本次启动后实际处理的 batch 平均耗时估算，兼容从 epoch 中间续训。
+            eta_minutes = spend_time / cur_step * (total_iters - step - 1) / 60
             log_swanlab_training_metrics(
                 swanlab_,
                 epoch=epoch,
@@ -176,10 +186,9 @@ def train_epoch(
                 },
             )
 
-        # 原生 checkpoint 只在参数更新后保存以避开未序列化的累积梯度；DeepSpeed 可保存完整内部状态。
+        # checkpoint 只在参数更新边界保存，避免恢复后丢失尚未完成的累积梯度。
         checkpoint_due = (step + 1) % cfg.save_interval == 0 or step == total_iters - 1
-        checkpoint_safe = cfg.use_deepspeed or should_update
-        if checkpoint_due and checkpoint_safe:
+        if checkpoint_due and should_update:
             model.eval()
 
             check_point_path: str = get_model_weight_path(cfg)
@@ -298,6 +307,8 @@ def main():
     cfg: PretrainConfig = get_pretrain_config()
     if cfg.use_deepspeed and cfg.use_compile:
         raise ValueError("当前预训练入口暂不建议同时启用 DeepSpeed 与 torch.compile，请先关闭其中一个。")
+    if cfg.save_interval < cfg.accumulation_steps or cfg.save_interval % cfg.accumulation_steps != 0:
+        raise ValueError("save_interval 必须大于等于 accumulation_steps，且必须是 accumulation_steps 的整数倍。")
 
     # 初始化分布式环境和随机种子。分布式训练中，每个进程绑定 LOCAL_RANK 对应的 GPU；随机种子叠加全局 rank，使不同进程使用相互独立但可复现的随机序列。
     local_rank = init_distributed(use_deepspeed=cfg.use_deepspeed)
@@ -364,6 +375,12 @@ def main():
             lr_scheduler=lr_scheduler,
             config=ds_config,
         )
+        effective_accumulation_steps = model.gradient_accumulation_steps()
+        if cfg.save_interval < effective_accumulation_steps or cfg.save_interval % effective_accumulation_steps != 0:
+            raise ValueError(
+                "save_interval 必须大于等于 DeepSpeed 实际使用的 gradient_accumulation_steps，"
+                "且必须是它的整数倍。"
+            )
 
     # DeepSpeed 从 engine 恢复分片状态；原生 checkpoint 恢复模型、优化器、调度器、GradScaler 和训练位置。
     last_end_epoch, last_end_step = 0, -1
@@ -386,7 +403,7 @@ def main():
     if dist.is_initialized() and not cfg.use_deepspeed:
         model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
 
-    # 在模型和 DDP 初始化后恢复 RNG，避免初始化过程消耗续训所需的随机序列。
+    # TODO: 在模型和 DDP 初始化后恢复 RNG；当前只保存 rank 0，后续在 world size 不变时按 rank 精确恢复，变化时采用非精确续训。
     if ckp_data is not None:
         restore_rng_state(ckp_data)
 

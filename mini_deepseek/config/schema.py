@@ -178,7 +178,7 @@ class TrainConfig(BaseConfig):
     # ----- DeepSpeed -----
     use_deepspeed: bool = Field(False, description="是否启用 DeepSpeed 训练引擎")
     deepspeed_config: str | None = Field(None, description="DeepSpeed 配置文件路径；为空时按当前训练参数自动生成")
-    deepspeed_zero_stage: Literal[0, 1, 2] = Field(0, description="DeepSpeed ZeRO stage（当前预训练入口建议使用 0/1/2）")
+    deepspeed_zero_stage: Literal[0, 1, 2] = Field(0, description="DeepSpeed ZeRO stage（当前预训练入口仅支持 0/1/2，不支持 Stage 3）")
     deepspeed_offload_optimizer: bool = Field(False, description="是否启用 DeepSpeed CPU optimizer offload")
     deepspeed_tensor_parallel_size: int = Field(1, gt=0, description="DeepSpeed AutoTP 大小；1 表示关闭张量并行")
     

@@ -126,12 +126,70 @@ def build_deepspeed_config(cfg: TrainConfig) -> dict[str, Any]:
     return ds_config
 
 
+def _complete_and_validate_shared_config(ds_config: dict[str, Any], cfg: TrainConfig) -> None:
+    """
+    补齐并校验项目配置与外部 DeepSpeed 配置共用的训练字段。
+
+    外部配置缺少公共字段时使用项目配置补齐；显式提供但值不一致时集中报错，
+    防止 DataLoader、scheduler 和 DeepSpeed engine 使用不同的训练语义。
+    ZeRO、offload 和通信参数等 DeepSpeed 专属字段不在此处修改。
+
+    Args:
+        ds_config: 从外部 JSON 或 YAML 加载的 DeepSpeed 配置。
+        cfg: 项目训练配置，作为公共训练字段的唯一基准。
+
+    Returns:
+        None。
+
+    Raises:
+        ValueError: 外部配置中的公共训练字段与项目配置不一致。
+    """
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    expected_values = {
+        "train_micro_batch_size_per_gpu": cfg.batch_size,
+        "gradient_accumulation_steps": cfg.accumulation_steps,
+        "train_batch_size": cfg.batch_size * cfg.accumulation_steps * world_size,
+        "gradient_clipping": cfg.grad_clip,
+    }
+    conflicts: list[str] = []
+    for key, expected in expected_values.items():
+        if key not in ds_config:
+            ds_config[key] = expected
+        elif ds_config[key] != expected:
+            conflicts.append(f"{key}: 外部配置={ds_config[key]!r}, 项目配置={expected!r}")
+
+    expected_precision = {
+        "bf16": cfg.dtype == "bfloat16",
+        "fp16": cfg.dtype == "float16",
+    }
+    for section_name, expected_enabled in expected_precision.items():
+        section = ds_config.setdefault(section_name, {})
+        if not isinstance(section, dict):
+            conflicts.append(f"{section_name}: 外部配置必须是对象，实际为 {section!r}")
+            continue
+        if "enabled" not in section:
+            section["enabled"] = expected_enabled
+        elif section["enabled"] != expected_enabled:
+            conflicts.append(
+                f"{section_name}.enabled: 外部配置={section['enabled']!r}, "
+                f"项目配置={expected_enabled!r}"
+            )
+
+    if conflicts:
+        conflict_text = "\n  - ".join(conflicts)
+        raise ValueError(
+            "外部 DeepSpeed 配置与项目训练配置存在冲突。公共训练字段必须由项目配置统一控制："
+            f"\n  - {conflict_text}"
+        )
+
+
 def resolve_deepspeed_config(cfg: TrainConfig) -> dict[str, Any]:
     """
     解析当前训练实际使用的 DeepSpeed 配置。
 
     优先读取 `cfg.deepspeed_config` 指定的外部文件；未指定时根据训练参数自动
-    生成。当前训练入口只允许 ZeRO stage 0、1 或 2。
+    生成。外部配置缺少公共训练字段时从项目配置补齐，显式冲突时直接报错。
+    当前训练入口只允许 ZeRO stage 0、1 或 2。
 
     Args:
         cfg: 训练配置，提供外部配置路径和自动生成配置所需参数。
@@ -141,10 +199,14 @@ def resolve_deepspeed_config(cfg: TrainConfig) -> dict[str, Any]:
 
     Raises:
         ImportError: 外部配置为 YAML，但环境中未安装 `pyyaml`。
-        ValueError: 外部配置格式不受支持，或 ZeRO stage 不是 0、1、2。
+        ValueError: 外部配置格式不受支持、公共训练字段冲突，或 ZeRO stage
+            不是 0、1、2。
     """
     if cfg.deepspeed_config:
         ds_config = _load_json_or_yaml(cfg.deepspeed_config)
+        if not isinstance(ds_config, dict):
+            raise ValueError("DeepSpeed 配置文件的根节点必须是 JSON/YAML 对象。")
+        _complete_and_validate_shared_config(ds_config, cfg)
         logger.info(f"使用外部 DeepSpeed 配置文件: {cfg.deepspeed_config}")
     else:
         ds_config = build_deepspeed_config(cfg)

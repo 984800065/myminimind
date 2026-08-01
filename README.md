@@ -134,7 +134,13 @@ CUDA_VISIBLE_DEVICES=0,1 uv run deepspeed \
   --batch-size 4
 ```
 
-可通过 `--deepspeed-zero-stage 0|1|2`、`--deepspeed-offload-optimizer` 和 `--deepspeed-tensor-parallel-size` 调整 DeepSpeed。当前预训练入口支持 ZeRO Stage 0、1、2。
+可通过 `--deepspeed-zero-stage 0|1|2`、`--deepspeed-offload-optimizer` 和 `--deepspeed-tensor-parallel-size` 调整 DeepSpeed。当前预训练入口仅支持 ZeRO Stage 0、1、2，不能启用 ZeRO Stage 3。
+
+当前预训练入口尚未完成 DeepSpeed Tensor Parallel 的数据切分、全局 batch size 计算和权重合并适配，因此 `deepspeed_tensor_parallel_size` 必须保持为 `1`。
+
+使用外部 DeepSpeed JSON/YAML 时，micro batch、梯度累积、全局 batch、梯度裁剪和 FP16/BF16 精度由项目训练配置统一控制。外部文件缺少这些字段时会自动补齐，显式配置不一致时会在启动阶段报错；外部文件主要用于配置 ZeRO、offload 和通信参数。
+
+`save_interval` 按 micro-batch step 计数，必须大于等于 `accumulation_steps`，并且是 `accumulation_steps` 的整数倍，确保 checkpoint 只在参数更新边界保存。
 
 ## SFT、DPO 与蒸馏
 
