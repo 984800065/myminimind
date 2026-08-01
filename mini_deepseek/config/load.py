@@ -258,6 +258,18 @@ def _add_dpo_extra_parser_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--beta", type=float, default=None)
 
 
+def _add_distillation_extra_parser_args(parser: argparse.ArgumentParser) -> None:
+    """注册 teacher 权重和 soft-target loss 参数。"""
+    parser.add_argument("--teacher-weight", type=str, default=None, dest="teacher_weight")
+    parser.add_argument("--distill-alpha", type=float, default=None, dest="distill_alpha")
+    parser.add_argument(
+        "--distill-temperature",
+        type=float,
+        default=None,
+        dest="distill_temperature",
+    )
+
+
 def _add_grpo_data_parser_args(parser: argparse.ArgumentParser) -> None:
     """注册 GRPO 数据采样和生成长度参数。"""
     parser.add_argument("--max-gen-len", type=int, default=None, dest="max_gen_len")
@@ -401,8 +413,8 @@ def _build_grpo_parser() -> argparse.ArgumentParser:
 
 
 def _build_distillation_parser() -> argparse.ArgumentParser:
-    """构建 On-policy 蒸馏命令行解析器。"""
-    parser = _new_parser("MiniDeepSeek On-policy Distillation (白盒蒸馏)")
+    """构建白盒 logit 蒸馏命令行解析器。"""
+    parser = _new_parser("MiniDeepSeek white-box logit distillation")
     _add_save_parser_args(parser)
     _add_train_hparam_parser_args(parser)
     _add_device_dtype_parser_args(parser)
@@ -410,6 +422,7 @@ def _build_distillation_parser() -> argparse.ArgumentParser:
     _add_tokenizer_parser_args(parser)
     _add_train_model_parser_args(parser)
     _add_resume_parser_args(parser)
+    _add_distillation_extra_parser_args(parser)
     _add_experiment_parser_args(parser)
     return parser
 

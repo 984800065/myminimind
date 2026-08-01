@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -8,16 +9,26 @@ from mini_deepseek.config import get_infer_config
 from mini_deepseek.config.schema import InferConfig
 from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig, load_mini_deepseek_config
 from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekForCausalLM
-from mini_deepseek.utils.train_utils import get_model_params, get_model_weight_path, load_tokenizer, setup_seed, sync_lm_config_with_tokenizer
+from mini_deepseek.utils.train_utils import get_model_params, load_tokenizer, resolve_model_weight_path, setup_seed, sync_lm_config_with_tokenizer
 
 
 def _checkpoint_path(infer_cfg: InferConfig) -> str:
-    return get_model_weight_path(infer_cfg)
+    return resolve_model_weight_path(infer_cfg)
 
 
-def _resolve_model_config(infer_cfg: InferConfig, tokenizer) -> MiniDeepSeekConfig:
+def _resolve_model_config(
+    infer_cfg: InferConfig,
+    tokenizer,
+    checkpoint_path: str,
+) -> MiniDeepSeekConfig:
     if infer_cfg.model_config_path:
         model_config = load_mini_deepseek_config(infer_cfg.model_config_path)
+    elif Path(checkpoint_path).with_suffix(".config.json").exists():
+        # Raw state dicts have no architecture metadata. Use the sidecar emitted
+        # during training so inference cannot silently rebuild the wrong model.
+        model_config = load_mini_deepseek_config(
+            Path(checkpoint_path).with_suffix(".config.json")
+        )
     else:
         model_config = MiniDeepSeekConfig(**infer_cfg.to_lm_config_kwargs())
     return sync_lm_config_with_tokenizer(model_config, tokenizer)
@@ -34,9 +45,9 @@ def init_model(infer_cfg: InferConfig) -> tuple[Any, Any]:
         return model, tokenizer
 
     tokenizer = load_tokenizer(infer_cfg.tokenizer_path)
-    model_config = _resolve_model_config(infer_cfg, tokenizer)
-    model = MiniDeepSeekForCausalLM(model_config)
     ckpt = _checkpoint_path(infer_cfg)
+    model_config = _resolve_model_config(infer_cfg, tokenizer, ckpt)
+    model = MiniDeepSeekForCausalLM(model_config)
     model.load_state_dict(torch.load(ckpt, map_location=infer_cfg.device), strict=True)
 
     get_model_params(model, model_config)

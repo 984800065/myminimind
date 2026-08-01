@@ -430,10 +430,15 @@ class MoEGate(nn.Module):
                 f = torch.zeros((batch_size, seq_len, self.num_routed_experts), device=hidden_states.device)
                 src = torch.ones(topk_idx.shape, device=hidden_states.device, dtype=f.dtype)
                 f.scatter_add_(dim=2, index=topk_idx, src=src)
-                # (batch_size, seq_len, num_routed_experts)
-                f = self.num_routed_experts / (self.top_k * seq_len) * f
                 # (batch_size, num_routed_experts)
-                f = f.mean(dim=1)
+                # Sum assignments over the sequence exactly once. The previous
+                # implementation scaled by 1/seq_len and then took mean(), which
+                # weakened this loss by another full sequence-length factor.
+                f = (
+                    self.num_routed_experts
+                    / (self.top_k * seq_len)
+                    * f.sum(dim=1)
+                )
 
                 # (batch_size, )
                 aux_loss = self.alpha * (f * p).sum(dim=1)
@@ -717,8 +722,6 @@ class MiniDeepSeekModel(MiniDeepSeekPreTrainedModel):
         self.rotary_emb = RotaryEmbedding(config=config, dim=dim)
 
         self.mtp_level = config.mtp_level
-        if self.mtp_level > 0 and not self.training:
-            raise ValueError("MTP modules are only for training and should not be used during inference")
         self.mtp_layers = nn.ModuleList([MiniDeepSeekMTPModule(config, mtp_module_idx=i, max_main_model_layer_idx=self.num_hidden_layers - 1) for i in range(1, config.mtp_level + 1)])
         
         self.post_init()
@@ -777,10 +780,15 @@ class MiniDeepSeekModel(MiniDeepSeekPreTrainedModel):
             )
 
         if position_ids is None:
-            # position_ids.shape == (1, seq_len)
-            position_ids = cache_position.unsqueeze(0)
-            # 如果你后面的 rotary 实现明确要求 batch 维完全展开，也可以用：
-            # position_ids = cache_position.unsqueeze(0).expand(batch_size, -1)
+            if attention_mask is not None and attention_mask.ndim == 2:
+                # Left padding must not shift real tokens to larger RoPE
+                # positions. During cached decoding attention_mask covers the
+                # full sequence, so keep only positions for the current query.
+                position_ids = attention_mask.long().cumsum(dim=-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 0)
+                position_ids = position_ids[:, -seq_len:]
+            else:
+                position_ids = cache_position.unsqueeze(0)
 
         # causal_mask.shape == (batch_size, 1, query_length, key_length)
         causal_mask = create_causal_mask(
@@ -801,7 +809,11 @@ class MiniDeepSeekModel(MiniDeepSeekPreTrainedModel):
         position_embeddings: tuple[torch.Tensor, torch.Tensor] = self.rotary_emb(hidden_states, position_ids=position_ids)
         aux_loss = torch.tensor(0.0, device=hidden_states.device)
 
-        mtp_hidden_states = hidden_states.new_zeros((self.mtp_level + 1, *hidden_states.shape))
+        # Keep MTP parameters in the module/state dict so a training checkpoint
+        # loads strictly, but do not execute auxiliary prediction layers in eval
+        # mode. Generation only needs the main model's final hidden state.
+        active_mtp_level = self.mtp_level if self.training else 0
+        mtp_hidden_states = hidden_states.new_zeros((active_mtp_level + 1, *hidden_states.shape))
 
         for decoder_layer in self.layers[:self.config.num_hidden_layers]:
             # hidden_states.shape == (batch_size, seq_len, hidden_size)
@@ -818,7 +830,7 @@ class MiniDeepSeekModel(MiniDeepSeekPreTrainedModel):
         
         mtp_hidden_states[0] = self.norm(hidden_states)
 
-        for i, mtp_layer in enumerate(self.mtp_layers[:self.mtp_level]):
+        for i, mtp_layer in enumerate(self.mtp_layers[:active_mtp_level]):
             # mtp_layer_idx \in [1, mtp_level]
             mtp_layer_idx = i + 1
 
@@ -864,8 +876,6 @@ class MiniDeepSeekForCausalLM(MiniDeepSeekPreTrainedModel, GenerationMixin):
         self.mtp_level = config.mtp_level
         self.mtp_lambda = config.mtp_lambda
 
-        if self.mtp_level > 0 and not self.training:
-            raise ValueError("MTP modules are only for training and should not be used during inference")
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -904,7 +914,7 @@ class MiniDeepSeekForCausalLM(MiniDeepSeekPreTrainedModel, GenerationMixin):
 
         # hidden_states.shape == (mtp_level + 1, batch_size, seq_len, hidden_size)
         # labels.shape == (batch_size, seq_len)
-        loss = torch.scalar_tensor(0.0, device=hidden_states.device)
+        step_losses: list[torch.Tensor] = []
         last_step_hidden: torch.Tensor | None = None
         last_step_labels: torch.Tensor | None = None
 
@@ -932,15 +942,22 @@ class MiniDeepSeekForCausalLM(MiniDeepSeekPreTrainedModel, GenerationMixin):
             flat_labels = step_labels.view(-1)
             # flat_labels.shape == (batch_size * (seq_len - mtp_step - 1),)
 
-            loss = loss + self.linear_cross_entropy(
-                self.lm_head,
-                flat_hidden,
-                flat_labels,
+            step_losses.append(
+                self.linear_cross_entropy(
+                    self.lm_head,
+                    flat_hidden,
+                    flat_labels,
+                )
             )
             last_step_hidden = step_hidden
             last_step_labels = step_labels
 
-        loss = self.mtp_lambda * loss / (self.mtp_level + 1)
+        # The ordinary next-token objective always keeps weight 1.0. `mtp_lambda`
+        # controls only auxiliary future-token heads; otherwise changing it would
+        # unexpectedly rescale the entire language-model loss even at MTP level 0.
+        loss = step_losses[0]
+        if len(step_losses) > 1:
+            loss = loss + self.mtp_lambda * torch.stack(step_losses[1:]).mean()
 
         if not torch.isfinite(loss).all():
             assert last_step_hidden is not None and last_step_labels is not None
@@ -979,8 +996,28 @@ class MiniDeepSeekForCausalLM(MiniDeepSeekPreTrainedModel, GenerationMixin):
         if labels is not None:
             loss = self._compute_mtp_loss(hidden_states, labels)
 
-        # logits.shape == (batch_size, seq_len, vocab_size)
-        logits: torch.Tensor = self.lm_head(hidden_states[0])
+        # `logits_to_keep` follows the Hugging Face causal-LM convention:
+        #   0          -> materialize logits for the full sequence
+        #   positive N -> materialize only the last N positions
+        #   tensor     -> select explicit sequence positions
+        #
+        # RL training only needs completion-token probabilities. Slicing hidden
+        # states before lm_head avoids allocating prompt_len * vocab_size logits.
+        main_hidden_states = hidden_states[0]
+        if isinstance(logits_to_keep, int):
+            if logits_to_keep < 0:
+                raise ValueError(
+                    f"logits_to_keep must be >= 0, got {logits_to_keep}."
+                )
+            logits_hidden_states = (
+                main_hidden_states
+                if logits_to_keep == 0
+                else main_hidden_states[:, -logits_to_keep:, :]
+            )
+        else:
+            logits_hidden_states = main_hidden_states[:, logits_to_keep, :]
+
+        logits: torch.Tensor = self.lm_head(logits_hidden_states)
         if not return_dict:
             output = (logits, present_key_values, hidden_states, aux_loss)
             return ((loss,) + output) if loss is not None else output

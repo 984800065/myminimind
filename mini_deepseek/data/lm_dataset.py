@@ -52,14 +52,24 @@ class PretrainDataset(Dataset):
         sample: dict = self.samples[index]
         prefix_tokens = [self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id is not None else []
         suffix_tokens = [self.tokenizer.eos_token_id] if self.tokenizer.eos_token_id is not None else []
-        max_text_length = max(1, self.max_length - len(prefix_tokens) - len(suffix_tokens))
+        special_token_count = len(prefix_tokens) + len(suffix_tokens)
+        if self.max_length <= special_token_count:
+            raise ValueError(
+                f"max_length={self.max_length} must leave room for text after "
+                f"{special_token_count} BOS/EOS tokens."
+            )
+        max_text_length = self.max_length - special_token_count
 
         tokens = self.tokenizer(str(sample["text"]), add_special_tokens=False, max_length=max_text_length, truncation=True).input_ids
         tokens = prefix_tokens + tokens + suffix_tokens
+        real_token_count = len(tokens)
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         labels = input_ids.clone()
-        labels[input_ids == self.tokenizer.pad_token_id] = -100
+        # Mask by sequence length, not token value. Some tokenizers intentionally
+        # reuse EOS as PAD; value-based masking would then remove every real EOS
+        # target and teach the model not to stop.
+        labels[real_token_count:] = -100
         return input_ids, labels
 
 
@@ -75,30 +85,39 @@ class SFTDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def create_chat_prompt(self, conversations: list[dict]) -> list[str]:
+    def create_chat_prompt(self, conversations: list[dict]) -> str:
         messages = conversations.copy()
         tools = conversations[0]["functions"] if (conversations and conversations[0]["role"] == "system" and conversations[0].get("functions")) else None
 
-        chat_strs: list[str] = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, tools=tools)
+        chat_strs: str = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False, tools=tools)
         return chat_strs
 
-    def generate_labels(self, input_ids: list[int]) -> list[int]:
+    def generate_labels(
+        self,
+        input_ids: list[int],
+        attention_mask: list[int],
+    ) -> list[int]:
         labels = [-100] * len(input_ids)
+        real_token_count = sum(attention_mask)
         i = 0
-        while i < len(input_ids):
+        while i < real_token_count:
             if input_ids[i : i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
 
-                while end < len(input_ids):
+                while end < real_token_count:
                     if input_ids[end : end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
 
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                # When truncation cuts through an assistant response there is no
+                # EOS marker. Supervise only the remaining real tokens; padding
+                # stays at -100.
+                label_end = end + len(self.eos_id) if end < real_token_count else real_token_count
+                for j in range(start, min(label_end, real_token_count)):
                     labels[j] = input_ids[j]
 
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+                i = label_end
             else:
                 i += 1
 
@@ -107,10 +126,20 @@ class SFTDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         sample: dict = self.samples[index]
         prompts = self.create_chat_prompt(sample["conversations"])
-        input_ids: list[int] = self.tokenizer(prompts).input_ids[: self.max_length]
-        input_ids.extend([self.tokenizer.pad_token_id] * (self.max_length - len(input_ids)))
-
-        labels = self.generate_labels(input_ids)
+        encoding = self.tokenizer(
+            prompts,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+        )
+        input_ids: list[int] = encoding["input_ids"]
+        labels = self.generate_labels(input_ids, encoding["attention_mask"])
+        if all(label == -100 for label in labels):
+            raise ValueError(
+                f"SFT sample {index} contains no assistant tokens after chat "
+                "template rendering/truncation."
+            )
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 
@@ -142,10 +171,21 @@ class DPODataset(Dataset):
         rejected_encoding = self.tokenizer(rejected_prompt, truncation=True, max_length=self.max_length, padding="max_length")
 
         chosen_input_ids = chosen_encoding["input_ids"]
-        chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
+        chosen_loss_mask = self.generate_loss_mask(
+            chosen_input_ids,
+            chosen_encoding["attention_mask"],
+        )
 
         rejected_input_ids = rejected_encoding["input_ids"]
-        rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+        rejected_loss_mask = self.generate_loss_mask(
+            rejected_input_ids,
+            rejected_encoding["attention_mask"],
+        )
+        if not any(chosen_loss_mask) or not any(rejected_loss_mask):
+            raise ValueError(
+                f"DPO sample {index} contains no assistant tokens in chosen or "
+                "rejected conversation after rendering/truncation."
+            )
 
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
@@ -164,23 +204,25 @@ class DPODataset(Dataset):
             "mask_rejected": mask_rejected,
         }
 
-    def generate_loss_mask(self, input_ids):
+    def generate_loss_mask(self, input_ids, attention_mask):
         loss_mask = [0] * len(input_ids)
+        real_token_count = sum(attention_mask)
         i = 0
-        while i < len(input_ids):
+        while i < real_token_count:
             if input_ids[i : i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
 
-                while end < len(input_ids):
+                while end < real_token_count:
                     if input_ids[end : end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
 
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                mask_end = end + len(self.eos_id) if end < real_token_count else real_token_count
+                for j in range(start, min(mask_end, real_token_count)):
                     loss_mask[j] = 1
 
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+                i = mask_end
             else:
                 i += 1
 
@@ -200,14 +242,27 @@ class RLAIFDataset(Dataset):
         return len(self.samples)
 
     def create_chat_prompt(self, conversations):
-        message = []
+        messages = []
         answer = ""
-        for i, turn in enumerate(conversations):
-            role = "user" if i % 2 == 0 else "assistant"
-            ans = turn["content"]
-            message.append({"role": role, "content": ans})
+        for index, turn in enumerate(conversations):
+            # Prefer explicit roles. The alternating fallback keeps compatibility
+            # with older MiniMind datasets containing only `content`.
+            role = turn.get("role") or ("user" if index % 2 == 0 else "assistant")
+            messages.append({"role": role, "content": turn["content"]})
 
-        prompt = self.tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+        # RLAIF rollout input must end before the target assistant response.
+        # Keeping a ground-truth answer in the rendered prompt leaks the answer
+        # and makes the policy generate a continuation instead of a solution.
+        if messages and messages[-1]["role"] == "assistant":
+            answer = messages.pop()["content"]
+        if not messages:
+            raise ValueError("RLAIF sample must contain at least one prompt message.")
+
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
         return prompt, answer
 
     def __getitem__(self, index):

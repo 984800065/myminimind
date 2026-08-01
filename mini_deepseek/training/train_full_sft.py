@@ -28,6 +28,7 @@ from mini_deepseek.utils.train_utils import (
     lm_checkpoint,
     log_swanlab_training_metrics,
     resolve_lm_config_and_tokenizer,
+    restore_rng_state,
     setup_seed,
 )
 
@@ -71,7 +72,15 @@ def train_epoch(
             cur_loss = loss.item()
             cur_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
 
-            loss = loss / cfg.accumulation_steps
+            # The final accumulation window can contain fewer micro-batches.
+            # Divide by its real size so the last optimizer update is not
+            # artificially smaller than all preceding updates.
+            window_start = (step // cfg.accumulation_steps) * cfg.accumulation_steps
+            accumulation_divisor = min(
+                cfg.accumulation_steps,
+                total_iters - window_start,
+            )
+            loss = loss / accumulation_divisor
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
             cur_step += 1
@@ -112,12 +121,15 @@ def train_epoch(
                 },
             )
 
-        if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
+        # Resume payloads do not contain in-flight parameter gradients. Save
+        # only after an optimizer update, when skipping completed batches is exact.
+        if should_update and ((step + 1) % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
             lm_checkpoint(
                 cfg=cfg,
                 model=model,
                 optimizer=optimizer,
+                lm_config=lm_config,
                 lr_scheduler=lr_scheduler,
                 scaler=scaler,
                 epoch=epoch,
@@ -147,15 +159,21 @@ def train(
     for epoch in range(start_epoch, cfg.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch)
-        indices = torch.randperm(len(train_dataset)).tolist()
         skip = (last_end_step + 1) if (epoch == start_epoch and last_end_step >= 0) else 0
+        if skip == 0:
+            setup_seed(42 + epoch)
+        epoch_generator = torch.Generator().manual_seed(42 + epoch)
+        indices = torch.randperm(
+            len(train_dataset),
+            generator=epoch_generator,
+        ).tolist()
         batch_sampler = SkipBatchSampler(train_sampler or indices, cfg.batch_size, skip)
         loader = DataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
             num_workers=cfg.num_workers,
             pin_memory=True,
+            generator=epoch_generator,
         )
 
         if skip > 0:
@@ -228,6 +246,8 @@ def main():
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     # ========== 8. 开始训练 ==========
+    if ckp_data is not None:
+        restore_rng_state(ckp_data)
     train(
         cfg,
         model,

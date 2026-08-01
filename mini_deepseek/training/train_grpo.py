@@ -4,7 +4,9 @@ MiniDeepSeek GRPO 训练入口：get_grpo_config() 加载参数，DDP + 混合�
 
 import os
 import re
+import time
 from contextlib import nullcontext
+from pathlib import Path
 
 import swanlab
 import torch
@@ -18,7 +20,10 @@ from transformers import AutoModel, AutoTokenizer
 
 from mini_deepseek.config import GRPOConfig, get_grpo_config
 from mini_deepseek.data import RLAIFDataset
-from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig
+from mini_deepseek.model.configuration_mini_deepseek import (
+    MiniDeepSeekConfig,
+    load_mini_deepseek_config,
+)
 from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekForCausalLM
 from mini_deepseek.utils.logger import logger
 from mini_deepseek.utils.train_utils import (
@@ -27,11 +32,124 @@ from mini_deepseek.utils.train_utils import (
     init_distributed,
     init_model,
     is_main_process,
+    load_tokenizer,
     lm_checkpoint,
     log_swanlab_training_metrics,
     resolve_lm_config_and_tokenizer,
+    resolve_model_weight_path,
+    restore_rng_state,
+    sync_lm_config_with_tokenizer,
     setup_seed,
 )
+
+
+def build_completion_mask(
+    completion_ids: torch.Tensor,
+    eos_token_id: int | None,
+) -> torch.Tensor:
+    """
+    Mark generated tokens through and including the first EOS.
+
+    Tokens after the first EOS are generation padding and must not contribute to
+    policy/KL loss. Including EOS itself is important: otherwise GRPO never
+    reinforces the action that terminates a response.
+    """
+    if eos_token_id is None:
+        return torch.ones_like(completion_ids, dtype=torch.bool)
+
+    is_eos = completion_ids.eq(eos_token_id)
+    sequence_length = completion_ids.size(1)
+    first_eos = torch.full(
+        (completion_ids.size(0),),
+        sequence_length,
+        dtype=torch.long,
+        device=completion_ids.device,
+    )
+    has_eos = is_eos.any(dim=1)
+    first_eos[has_eos] = is_eos.int().argmax(dim=1)[has_eos]
+    positions = torch.arange(sequence_length, device=completion_ids.device)
+    return positions.unsqueeze(0) <= first_eos.unsqueeze(1)
+
+
+def get_completion_log_probs(
+    model: MiniDeepSeekForCausalLM | DistributedDataParallel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    completion_length: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return completion log-probs and the model's optional MoE auxiliary loss."""
+    if completion_length <= 0:
+        raise ValueError("GRPO requires at least one generated completion token.")
+
+    # Keep one extra position: logits at sequence position t predict token t+1.
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        logits_to_keep=completion_length + 1,
+    )
+    prediction_logits = outputs.logits[:, :-1, :].float()
+    completion_ids = input_ids[:, -completion_length:]
+    if prediction_logits.shape[:2] != completion_ids.shape:
+        raise RuntimeError(
+            "Completion log-prob alignment failed: "
+            f"logits={tuple(prediction_logits.shape)}, "
+            f"tokens={tuple(completion_ids.shape)}."
+        )
+    log_probs = torch.gather(
+        prediction_logits.log_softmax(dim=-1),
+        dim=-1,
+        index=completion_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    return log_probs, outputs.aux_loss
+
+
+def resolve_grpo_model_config(
+    cfg: GRPOConfig,
+    base_weight: str,
+) -> tuple[MiniDeepSeekConfig, AutoTokenizer]:
+    """
+    Rebuild policy/reference from the base checkpoint's architecture sidecar.
+
+    GRPO changes optimization and context length, not hidden dimensions or
+    attention/MoE structure. Falling back to GRPO defaults for those fields can
+    make a valid SFT checkpoint fail with size mismatches.
+    """
+    tokenizer = load_tokenizer(cfg.tokenizer_path)
+    base_weight_path = Path(
+        resolve_model_weight_path(
+            cfg,
+            weight=base_weight,
+            include_debug=False,
+        )
+    )
+    config_path = base_weight_path.with_suffix(".config.json")
+    if not config_path.exists():
+        logger.warning(
+            f"基础权重缺少模型配置 sidecar: {config_path}，回退到 GRPO 配置。"
+        )
+        return resolve_lm_config_and_tokenizer(cfg)
+
+    lm_config = load_mini_deepseek_config(config_path)
+    sync_lm_config_with_tokenizer(lm_config, tokenizer)
+    context_length = cfg.data_max_seq_len + cfg.max_gen_len
+    lm_config.max_seq_len = context_length
+    lm_config.max_position_embeddings = context_length
+    if lm_config.dropout != 0.0:
+        logger.warning(
+            f"GRPO 将模型 dropout 从 {lm_config.dropout} 设为 0，"
+            "确保 rollout 与 policy log-prob 重算一致。"
+        )
+        lm_config.dropout = 0.0
+
+    # MTP is a pretraining-only auxiliary objective. Keeping its layers during
+    # GRPO would execute unnecessary future-token heads in policy train mode.
+    lm_config.mtp_level = 0
+
+    # Keep output/checkpoint naming aligned with the architecture actually loaded.
+    for field_name in cfg.__class__.model_fields:
+        if hasattr(lm_config, field_name):
+            setattr(cfg, field_name, getattr(lm_config, field_name))
+    return lm_config, tokenizer
 
 
 def calculate_rewards(
@@ -129,13 +247,14 @@ def grpo_train_epoch(
     tokenizer: AutoTokenizer,
     optimizer: optim.AdamW,
     scheduler: CosineAnnealingLR,
+    scaler: torch.amp.GradScaler,
     autocast_ctx,
     lm_config: MiniDeepSeekConfig,
     zero_based_start_step: int = 0,
     swanlab_: swanlab.Run | None = None,
 ) -> None:
     model.train()
-
+    start_time = time.time()
     pbar = tqdm(loader, total=total_iters, initial=zero_based_start_step, desc=f"Epoch[{epoch + 1}/{cfg.epochs}]", leave=True)
 
     optimizer.zero_grad(set_to_none=True)
@@ -149,71 +268,85 @@ def grpo_train_epoch(
             # (batch_size, data_max_seq_len)
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -cfg.data_max_seq_len :]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -cfg.data_max_seq_len :]
+        reward_prompts = [
+            tokenizer.decode(
+                row_ids[row_mask.bool()],
+                skip_special_tokens=False,
+            )
+            for row_ids, row_mask in zip(
+                prompt_inputs["input_ids"],
+                prompt_inputs["attention_mask"],
+                strict=True,
+            )
+        ]
 
+        model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
+        model_for_gen.eval()
         with torch.no_grad():
-            model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
             # (batch_size * num_generations, prompt_len + response_len)
             outputs = model_for_gen.generate(**prompt_inputs, max_new_tokens=cfg.max_gen_len, do_sample=True, temperature=0.8, num_return_sequences=cfg.num_generations, pad_token_id=tokenizer.pad_token_id)
+        # Some generation backends return inference tensors, which autograd
+        # cannot save for the policy backward pass.
+        if outputs.is_inference():
+            outputs = outputs.clone()
 
         # (batch_size * num_generations, response_len)
         completion_ids = outputs[:, prompt_inputs["input_ids"].size(1) :]
-
-        def get_per_tokne_logps(
-            model: MiniDeepSeekForCausalLM,
-            input_ids: torch.Tensor,
-            n_keep: int,
-        ):
-            # (batch_size * num_generations, total_seq_len)
-            input_ids = input_ids.detach().clone() if input_ids.is_inference() else input_ids
-            # (batch_size * num_generations, n_keep, vocab_size)
-            logits = model(input_ids, logits_to_keep=n_keep + 1).logits[:, :-1, :]
-            per_token_logps = []
-            for logits_row, ids_row in zip(logits, input_ids[:, -n_keep:], strict=True):
-                # (n_keep, vocab_size)
-                logits_row: torch.Tensor
-                # (n_keep, )
-                ids_row: torch.Tensor
-                ids_row = ids_row.detach().clone() if ids_row.is_inference() else ids_row
-                # (n_keep, )
-                per_token_logps.append(torch.gather(logits_row.log_softmax(dim=-1), dim=-1, index=ids_row[:, None]).squeeze(1))
-
-            # (batch_size * num_generations, n_keep)
-            return torch.stack(per_token_logps)
+        completion_mask = build_completion_mask(
+            completion_ids,
+            tokenizer.eos_token_id,
+        )
+        repeated_prompt_mask = prompt_inputs["attention_mask"].repeat_interleave(
+            cfg.num_generations,
+            dim=0,
+        )
+        full_attention_mask = torch.cat(
+            [repeated_prompt_mask, completion_mask.to(repeated_prompt_mask.dtype)],
+            dim=1,
+        )
 
         with autocast_ctx:
-            # completion_ids.shape == (batch_size * num_generations, response_len)
-            # (batch_size * num_generations, response_len)
-            per_token_logps = get_per_tokne_logps(model, outputs, completion_ids.size(1))
-            res = model(outputs) if lm_config.use_moe else None
-            aux_loss = res.aux_loss if res is not None else torch.tensor(0.0, device=cfg.device)
+            # This project fixes model dropout at zero, so switching back to
+            # train mode preserves rollout probabilities while enabling MoE to
+            # report its load-balancing auxiliary loss.
+            model.train()
+            per_token_logps, aux_loss = get_completion_log_probs(
+                model,
+                outputs,
+                full_attention_mask,
+                completion_ids.size(1),
+            )
+            if aux_loss is None:
+                aux_loss = torch.tensor(0.0, device=cfg.device)
 
         with torch.no_grad():
-            # (batch_size * num_generations, response_len)
-            ref_per_token_logps = get_per_tokne_logps(ref_model, outputs, completion_ids.size(1))
+            with autocast_ctx:
+                ref_per_token_logps, _ = get_completion_log_probs(
+                    ref_model,
+                    outputs,
+                    full_attention_mask,
+                    completion_ids.size(1),
+                )
 
         # len(completions) == batch_size * num_generations
         completions: list[str] = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         # (batch_size * num_generations, )
-        rewards: torch.Tensor = calculate_rewards(cfg, prompts, completions, reward_model, reward_tokenizer).to(cfg.device)
+        rewards: torch.Tensor = calculate_rewards(
+            cfg,
+            reward_prompts,
+            completions,
+            reward_model,
+            reward_tokenizer,
+        ).to(cfg.device)
 
         # (batch_size, num_generations)
         grouped_rewards = rewards.reshape(-1, cfg.num_generations)
         # (batch_size * num_generations, )
         inner_batch_mean_reward = grouped_rewards.mean(dim=1).repeat_interleave(cfg.num_generations)
         # (batch_size * num_generations, )
-        inner_batch_std_reward = grouped_rewards.std(dim=1).repeat_interleave(cfg.num_generations)
+        inner_batch_std_reward = grouped_rewards.std(dim=1, correction=0).repeat_interleave(cfg.num_generations)
         # (batch_size * num_generations, )
         advantages = torch.clamp((rewards - inner_batch_mean_reward) / (inner_batch_std_reward + 1e-8), min=-10, max=10)
-        # (batch_size * num_generations, )
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
-        # (batch_size * num_generations, response_len), dtype == torch.bool
-        is_eos: torch.Tensor = completion_ids == tokenizer.eos_token_id
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=cfg.device)
-        # 找每条生成序列里第一个 EOS token 的位置
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        # (batch_size * num_generations, response_len), dtype == torch.int
-        completion_mask = (torch.arange(is_eos.size(1), device=cfg.device) < eos_idx[:, None]).int()
 
         # (batch_size * num_generations, response_len)
         kl_div = ref_per_token_logps - per_token_logps
@@ -223,24 +356,36 @@ def grpo_train_epoch(
         per_token_loss = -(torch.exp(per_token_logps - per_token_logps.detach()) * advantages[:, None] - cfg.beta * per_token_kl)
         # \frac{1}{T} * \frac{1}{|o|} * \sum per_token_loss
         # ()
-        policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        completion_mask_float = completion_mask.to(per_token_loss.dtype)
+        completion_lengths = completion_mask_float.sum(dim=1).clamp_min(1.0)
+        policy_loss = (
+            (per_token_loss * completion_mask_float).sum(dim=1)
+            / completion_lengths
+        ).mean()
 
-        loss = (policy_loss + aux_loss) / cfg.accumulation_steps
-        loss.backward()
-
+        window_start = (step // cfg.accumulation_steps) * cfg.accumulation_steps
+        accumulation_divisor = min(
+            cfg.accumulation_steps,
+            total_iters - window_start,
+        )
         should_update = ((step + 1) % cfg.accumulation_steps == 0) or (step == total_iters - 1)
+        loss = (policy_loss + aux_loss) / accumulation_divisor
+        scaler.scale(loss).backward()
+
         if should_update:
             if cfg.grad_clip > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
         if step % cfg.log_interval == 0 or step == total_iters - 1:
-            policy_loss_val = loss.item() * cfg.accumulation_steps
+            policy_loss_val = policy_loss.item()
             current_aux_loss = aux_loss.item()
             avg_reward_val = rewards.mean().item()
-            avg_len_val = completion_mask.sum(dim=1).float().mean().item()
+            avg_len_val = completion_lengths.mean().item()
             current_lr = optimizer.param_groups[0]["lr"]
             spend_time = time.time() - start_time
             eta_min = spend_time / (step + 1) * total_iters // 60 - spend_time // 60
@@ -276,20 +421,25 @@ def grpo_train_epoch(
                 },
             )
 
-        if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
+        if should_update and ((step + 1) % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
             lm_checkpoint(
                 cfg=cfg,
                 model=model,
                 optimizer=optimizer,
+                lm_config=lm_config,
                 epoch=epoch,
                 step=step,
                 scheduler=scheduler,
+                scaler=scaler,
+                swanlab_=swanlab_,
             )
             model.train()
 
-        del prompt_inputs, outputs, completion_ids, per_token_logps, ref_per_token_logps
-        del completions, rewards, grouped_rewards, inner_batch_mean_reward, inner_batch_std_reward, advantages, completion_mask
+        del prompt_inputs, reward_prompts, outputs, completion_ids, full_attention_mask
+        del per_token_logps, ref_per_token_logps, completions, rewards
+        del grouped_rewards, inner_batch_mean_reward, inner_batch_std_reward
+        del advantages, completion_mask, completion_mask_float, completion_lengths
 
 
 def train(
@@ -301,6 +451,7 @@ def train(
     tokenizer: AutoTokenizer,
     optimizer: optim.AdamW,
     scheduler: CosineAnnealingLR,
+    scaler: torch.amp.GradScaler,
     autocast_ctx,
     lm_config: MiniDeepSeekConfig,
     train_sampler: DistributedSampler | None,
@@ -313,15 +464,21 @@ def train(
     for epoch in range(start_epoch, cfg.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch)
-        indices = torch.randperm(len(train_dataset)).tolist()
         skip = (last_end_step + 1) if (epoch == start_epoch and last_end_step >= 0) else 0
+        if skip == 0:
+            setup_seed(42 + epoch)
+        epoch_generator = torch.Generator().manual_seed(42 + epoch)
+        indices = torch.randperm(
+            len(train_dataset),
+            generator=epoch_generator,
+        ).tolist()
         batch_sampler = SkipBatchSampler(train_sampler or indices, cfg.batch_size, skip)
         loader = DataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
             num_workers=cfg.num_workers,
             pin_memory=True,
+            generator=epoch_generator,
         )
 
         if skip > 0:
@@ -338,6 +495,7 @@ def train(
                 tokenizer,
                 optimizer,
                 scheduler,
+                scaler,
                 autocast_ctx,
                 lm_config,
                 zero_based_start_step=skip,
@@ -357,6 +515,7 @@ def train(
                 tokenizer,
                 optimizer,
                 scheduler,
+                scaler,
                 autocast_ctx,
                 lm_config,
                 zero_based_start_step=0,
@@ -375,7 +534,8 @@ def main() -> None:
 
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(cfg.save_dir, exist_ok=True)
-    lm_config, tokenizer = resolve_lm_config_and_tokenizer(cfg)
+    base_weight = cfg.from_weight if cfg.from_weight != "none" else ("reason" if cfg.reasoning == 1 else "full_sft")
+    lm_config, tokenizer = resolve_grpo_model_config(cfg, base_weight)
     ckp_data = lm_checkpoint(cfg) if cfg.from_resume else None
 
     # ========== 3. 设置混合精度 ==========
@@ -393,7 +553,6 @@ def main() -> None:
         swanlab_ = swanlab
 
     # ========== 5. 初始化模型、Reward 与数据 ==========
-    base_weight = cfg.from_weight if cfg.from_weight != "none" else ("reason" if cfg.reasoning == 1 else "full_sft")
     # Policy 模型
     model, tokenizer = init_model(
         cfg=cfg,
@@ -429,6 +588,7 @@ def main() -> None:
     train_dataset = RLAIFDataset(cfg.data_path, tokenizer, max_length=cfg.data_max_seq_len)
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     optimizer = optim.AdamW(model.parameters(), lr=cfg.learning_rate)
+    scaler = torch.amp.GradScaler(enabled=(cfg.dtype == "float16"))
     loader_for_count = DataLoader(train_dataset, batch_size=cfg.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
     total_optimizer_steps = max(1, ((iters + cfg.accumulation_steps - 1) // cfg.accumulation_steps) * cfg.epochs)
@@ -441,6 +601,8 @@ def main() -> None:
         optimizer.load_state_dict(ckp_data["optimizer"])
         if "scheduler" in ckp_data:
             scheduler.load_state_dict(ckp_data["scheduler"])
+        if "scaler" in ckp_data:
+            scaler.load_state_dict(ckp_data["scaler"])
         last_end_epoch = ckp_data.get("epoch", 0)
         last_end_step = ckp_data.get("step", -1)
 
@@ -450,6 +612,8 @@ def main() -> None:
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     # ========== 8. 开始训练 ==========
+    if ckp_data is not None:
+        restore_rng_state(ckp_data)
     train(
         cfg,
         model,
@@ -459,6 +623,7 @@ def main() -> None:
         tokenizer,
         optimizer,
         scheduler,
+        scaler,
         autocast_ctx,
         lm_config,
         train_sampler,

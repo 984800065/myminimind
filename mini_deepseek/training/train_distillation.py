@@ -1,5 +1,5 @@
 """
-MiniDeepSeek On-policy 白盒蒸馏入口：get_distillation_config() 加载参数，DDP + 混合精度 + swanlab。
+MiniDeepSeek 白盒 logit 蒸馏入口：冻结 teacher + hard-label CE + soft-target KL。
 """
 
 import os
@@ -9,6 +9,7 @@ from contextlib import nullcontext
 import swanlab
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
@@ -31,8 +32,47 @@ from mini_deepseek.utils.train_utils import (
     lm_checkpoint,
     log_swanlab_training_metrics,
     resolve_lm_config_and_tokenizer,
+    restore_rng_state,
     setup_seed,
 )
+
+
+def compute_distillation_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """
+    Compute token-level forward KL only where SFT labels are active.
+
+    Prompt and padding positions use label -100 and must not influence the
+    student. The T^2 factor keeps gradient scale comparable when temperature
+    softens both distributions.
+    """
+    # Match the causal LM hard-loss alignment: logits at position t predict the
+    # label at t + 1. Using labels without this shift distills the wrong token.
+    active_mask = labels[:, 1:].ne(-100)
+    if not active_mask.any():
+        raise ValueError("Distillation batch contains no supervised assistant tokens.")
+
+    student_log_probs = F.log_softmax(
+        student_logits[:, :-1, :].float() / temperature,
+        dim=-1,
+    )
+    teacher_probs = F.softmax(
+        teacher_logits[:, :-1, :].float() / temperature,
+        dim=-1,
+    )
+    token_kl = F.kl_div(
+        student_log_probs,
+        teacher_probs,
+        reduction="none",
+    ).sum(dim=-1)
+    return (
+        token_kl.masked_select(active_mask).mean()
+        * (temperature * temperature)
+    )
 
 
 def train_epoch(
@@ -40,6 +80,7 @@ def train_epoch(
     epoch: int,
     loader: DataLoader,
     model: MiniDeepSeekForCausalLM,
+    teacher_model: MiniDeepSeekForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
     scaler: torch.amp.GradScaler,
@@ -67,11 +108,34 @@ def train_epoch(
 
         with autocast_ctx:
             res: CausalLMOutputWithPast = model(input_ids=input_ids, labels=labels)
-            loss: torch.Tensor = res.loss + res.aux_loss
+            with torch.no_grad():
+                teacher_res: CausalLMOutputWithPast = teacher_model(input_ids=input_ids)
+
+            assert res.loss is not None
+            assert res.aux_loss is not None
+            distill_loss = compute_distillation_kl(
+                student_logits=res.logits,
+                teacher_logits=teacher_res.logits,
+                labels=labels,
+                temperature=cfg.distill_temperature,
+            )
+            hard_loss = res.loss
+            task_loss = (
+                (1.0 - cfg.distill_alpha) * hard_loss
+                + cfg.distill_alpha * distill_loss
+            )
+            loss: torch.Tensor = task_loss + res.aux_loss
             cur_loss = loss.item()
             cur_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            cur_hard_loss = hard_loss.item()
+            cur_distill_loss = distill_loss.item()
 
-            loss = loss / cfg.accumulation_steps
+            window_start = (step // cfg.accumulation_steps) * cfg.accumulation_steps
+            accumulation_divisor = min(
+                cfg.accumulation_steps,
+                total_iters - window_start,
+            )
+            loss = loss / accumulation_divisor
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
             cur_step += 1
@@ -107,17 +171,20 @@ def train_epoch(
                 eta_minutes=float(eta_min),
                 train_metrics={
                     "loss": cur_loss,
-                    "logits_loss": cur_logits_loss,
+                    "task_loss": cur_logits_loss,
+                    "hard_label_loss": cur_hard_loss,
+                    "distill_kl_loss": cur_distill_loss,
                     "aux_loss": cur_aux_loss,
                 },
             )
 
-        if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
+        if should_update and ((step + 1) % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
             lm_checkpoint(
                 cfg=cfg,
                 model=model,
                 optimizer=optimizer,
+                lm_config=lm_config,
                 lr_scheduler=lr_scheduler,
                 scaler=scaler,
                 epoch=epoch,
@@ -126,12 +193,13 @@ def train_epoch(
             )
             model.train()
 
-        del input_ids, labels, res, loss
+        del input_ids, labels, res, teacher_res, distill_loss, hard_loss, task_loss, loss
 
 
 def train(
     cfg: DistillationConfig,
     model: MiniDeepSeekForCausalLM,
+    teacher_model: MiniDeepSeekForCausalLM,
     optimizer: optim.AdamW,
     lr_scheduler: optim.lr_scheduler.CosineAnnealingLR,
     scaler: torch.amp.GradScaler,
@@ -147,23 +215,29 @@ def train(
     for epoch in range(start_epoch, cfg.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch)
-        indices = torch.randperm(len(train_dataset)).tolist()
         skip = (last_end_step + 1) if (epoch == start_epoch and last_end_step >= 0) else 0
+        if skip == 0:
+            setup_seed(42 + epoch)
+        epoch_generator = torch.Generator().manual_seed(42 + epoch)
+        indices = torch.randperm(
+            len(train_dataset),
+            generator=epoch_generator,
+        ).tolist()
         batch_sampler = SkipBatchSampler(train_sampler or indices, cfg.batch_size, skip)
         loader = DataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
             num_workers=cfg.num_workers,
             pin_memory=True,
+            generator=epoch_generator,
         )
 
         if skip > 0:
             logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 跳过前 {skip} step，从 step {skip} 开始")
-            train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, skip, swanlab_)
+            train_epoch(cfg, epoch, loader, model, teacher_model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, skip, swanlab_)
         else:
             logger.info(f"Epoch[{epoch + 1}/{cfg.epochs}] 从头开始训练")
-            train_epoch(cfg, epoch, loader, model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, 0, swanlab_)
+            train_epoch(cfg, epoch, loader, model, teacher_model, optimizer, lr_scheduler, scaler, autocast_ctx, lm_config, 0, swanlab_)
 
 
 def main():
@@ -200,6 +274,14 @@ def main():
         lm_config=lm_config,
         tokenizer=tokenizer,
     )
+    teacher_model, _ = init_model(
+        cfg=cfg,
+        lm_config=lm_config,
+        tokenizer=tokenizer,
+        from_weight=cfg.teacher_weight,
+    )
+    teacher_model.eval().requires_grad_(False)
+    logger.info(f"Teacher weight: {cfg.teacher_weight}")
     if cfg.use_compile:
         model = torch.compile(model)
         logger.info("torch.compile enabled")
@@ -230,9 +312,12 @@ def main():
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     # ========== 8. 开始训练 ==========
+    if ckp_data is not None:
+        restore_rng_state(ckp_data)
     train(
         cfg,
         model,
+        teacher_model,
         optimizer,
         lr_scheduler,
         scaler,

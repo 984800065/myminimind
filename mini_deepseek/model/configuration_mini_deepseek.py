@@ -134,6 +134,13 @@ class MiniDeepSeekConfig(PretrainedConfig):
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
         self.group_num = group_num
+        if num_attention_heads <= 0:
+            raise ValueError("num_attention_heads must be greater than 0.")
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by "
+                f"num_attention_heads ({num_attention_heads})."
+            )
 
         attention_type = attention_type.lower()
         attention_name_map = {
@@ -143,6 +150,13 @@ class MiniDeepSeekConfig(PretrainedConfig):
 
         if attention_type not in attention_name_map.keys():
             raise ValueError(f"Unsupported attention_type={attention_type!r}. Expected one of: 'gqa', 'mla'.")
+        if group_num <= 0:
+            raise ValueError("group_num must be greater than 0.")
+        if attention_type == "gqa" and num_attention_heads % group_num != 0:
+            raise ValueError(
+                f"num_attention_heads ({num_attention_heads}) must be divisible "
+                f"by group_num ({group_num}) for GQA."
+            )
         self.attention_type = attention_type
 
         self._attn_implementation = attention_name_map[attention_type]
@@ -222,6 +236,15 @@ class MiniDeepSeekConfig(PretrainedConfig):
 
         # MoE configurations
         self.use_moe = use_moe
+        if num_experts_per_token <= 0 or num_routed_experts <= 0:
+            raise ValueError(
+                "num_experts_per_token and num_routed_experts must be greater than 0."
+            )
+        if num_experts_per_token > num_routed_experts:
+            raise ValueError(
+                "num_experts_per_token must not exceed num_routed_experts, "
+                f"got {num_experts_per_token} > {num_routed_experts}."
+            )
         self.num_experts_per_token = num_experts_per_token
         self.num_routed_experts = num_routed_experts
         self.num_shared_experts = num_shared_experts

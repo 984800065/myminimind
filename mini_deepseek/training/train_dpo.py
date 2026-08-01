@@ -32,6 +32,7 @@ from mini_deepseek.utils.train_utils import (
     lm_checkpoint,
     log_swanlab_training_metrics,
     resolve_lm_config_and_tokenizer,
+    restore_rng_state,
     setup_seed,
 )
 
@@ -135,7 +136,12 @@ def train_epoch(
 
             epoch_avg_loss += cur_loss
             epoch_avg_aux_loss += cur_aux_loss
-            loss = loss / cfg.accumulation_steps
+            window_start = (step // cfg.accumulation_steps) * cfg.accumulation_steps
+            accumulation_divisor = min(
+                cfg.accumulation_steps,
+                total_iters - window_start,
+            )
+            loss = loss / accumulation_divisor
             cur_step += 1
             pbar.set_postfix({"batch_loss": cur_loss, "epoch_avg_loss": epoch_avg_loss / cur_step, "batch_aux_loss": cur_aux_loss, "epoch_avg_aux_loss": epoch_avg_aux_loss / cur_step})
 
@@ -174,12 +180,15 @@ def train_epoch(
                 },
             )
 
-        if (step % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
+        # Saving between optimizer steps would lose accumulated gradients while
+        # resume still skips those micro-batches.
+        if should_update and ((step + 1) % cfg.save_interval == 0 or step == total_iters - 1) and is_main_process():
             model.eval()
             lm_checkpoint(
                 cfg=cfg,
                 model=model,
                 optimizer=optimizer,
+                lm_config=lm_config,
                 lr_scheduler=lr_scheduler,
                 scaler=scaler,
                 epoch=epoch,
@@ -211,15 +220,21 @@ def train(
     for epoch in range(start_epoch, cfg.epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch)
-        indices = torch.randperm(len(train_dataset)).tolist()
         skip = (last_end_step + 1) if (epoch == start_epoch and last_end_step >= 0) else 0
+        if skip == 0:
+            setup_seed(42 + epoch)
+        epoch_generator = torch.Generator().manual_seed(42 + epoch)
+        indices = torch.randperm(
+            len(train_dataset),
+            generator=epoch_generator,
+        ).tolist()
         batch_sampler = SkipBatchSampler(train_sampler or indices, cfg.batch_size, skip)
         loader = DataLoader(
             train_dataset,
             batch_sampler=batch_sampler,
             num_workers=cfg.num_workers,
             pin_memory=True,
+            generator=epoch_generator,
         )
 
         if skip > 0:
@@ -304,6 +319,8 @@ def main():
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     # ========== 8. 开始训练 ==========
+    if ckp_data is not None:
+        restore_rng_state(ckp_data)
     train(
         cfg,
         model,

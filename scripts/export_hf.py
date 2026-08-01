@@ -15,7 +15,7 @@ import torch
 from mini_deepseek.config import get_infer_config
 from mini_deepseek.model.configuration_mini_deepseek import MiniDeepSeekConfig, load_mini_deepseek_config
 from mini_deepseek.model.modeling_mini_deepseek import MiniDeepSeekForCausalLM, register_mini_deepseek_for_auto_class
-from mini_deepseek.utils.train_utils import get_model_weight_path, load_tokenizer, sync_lm_config_with_tokenizer
+from mini_deepseek.utils.train_utils import load_tokenizer, resolve_model_weight_path, sync_lm_config_with_tokenizer
 
 
 def _parse_args() -> tuple[argparse.Namespace, list[str]]:
@@ -37,13 +37,21 @@ def _checkpoint_path(
 ) -> Path:
     if checkpoint is not None:
         return checkpoint
-    return Path(get_model_weight_path(infer_cfg))
+    return Path(resolve_model_weight_path(infer_cfg))
 
 
-def _resolve_model_config(infer_cfg, tokenizer) -> MiniDeepSeekConfig:
+def _resolve_model_config(infer_cfg, tokenizer, checkpoint_path: Path) -> MiniDeepSeekConfig:
     if infer_cfg.model_config_path:
         model_config = load_mini_deepseek_config(infer_cfg.model_config_path)
+    elif checkpoint_path.with_suffix(".config.json").exists():
+        # Training writes this sidecar from the exact runtime config. Prefer it
+        # over inference defaults, which may describe a different architecture.
+        model_config = load_mini_deepseek_config(checkpoint_path.with_suffix(".config.json"))
     else:
+        print(
+            "Warning: checkpoint has no model config sidecar; "
+            "falling back to inference CLI/default architecture."
+        )
         model_config = MiniDeepSeekConfig(**infer_cfg.to_lm_config_kwargs())
     return sync_lm_config_with_tokenizer(model_config, tokenizer)
 
@@ -75,7 +83,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = load_tokenizer(infer_cfg.tokenizer_path)
-    model_config = _resolve_model_config(infer_cfg, tokenizer)
+    model_config = _resolve_model_config(infer_cfg, tokenizer, checkpoint_path)
     state_dict = torch.load(checkpoint_path, map_location="cpu")
 
     model = MiniDeepSeekForCausalLM(model_config)

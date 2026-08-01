@@ -248,9 +248,6 @@ class SFTConfig(TrainConfig):
     # ----- 数据 -----
     data_path: str = Field("./dataset/sft_512.jsonl", description="SFT 训练数据路径（jsonl）")
 
-    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
-    use_moe: bool = Field(True, description="是否使用 MoE 架构")
-
     # ----- 恢复与续训 -----
     from_weight: str = Field("pretrain", description="从哪个权重继续训，none 表示从头")
     from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
@@ -281,9 +278,6 @@ class DPOConfig(TrainConfig):
 
     # ----- 数据 -----
     data_path: str = Field("./dataset/dpo.jsonl", description="DPO 训练数据路径（jsonl）")
-
-    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
 
     # ----- 恢复与续训 -----
     from_weight: str = Field("full_sft", description="基于哪个权重训练")
@@ -323,18 +317,15 @@ class GRPOConfig(TrainConfig):
     data_path: str = Field("./dataset/rlaif-mini.jsonl", description="RLAIF 训练数据路径（jsonl）")
     data_max_seq_len: int = Field(66, gt=0, description="Prompt 最大长度")
     max_gen_len: int = Field(1536, gt=0, description="生成的最大长度")
-    num_generations: int = Field(8, gt=0, description="每个 prompt 生成的样本数")
-
-    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
+    num_generations: int = Field(8, ge=2, description="每个 prompt 生成的样本数；GRPO 组内标准化至少需要 2 个")
 
     # ----- 恢复与续训 -----
-    from_weight: str = Field("none", description="初始化 policy/reference 模型的基础权重；none 表示按 reasoning 自动选择")
+    from_weight: str = Field("full_sft", description="初始化 policy/reference 模型的基础权重")
     from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
 
     # ----- GRPO 专用 -----
     beta: float = Field(0.02, gt=0.0, description="KL 惩罚系数")
-    reasoning: int = Field(1, ge=0, le=1, description="推理模型类型（0=普通模型，1=推理模型）")
+    reasoning: int = Field(0, ge=0, le=1, description="是否启用 think/answer 格式奖励（0=关闭，1=启用）")
     # reward_model_path: str = Field(
     #     "../../internlm2-1_8b-reward",
     #     description="Reward 模型路径",
@@ -357,7 +348,7 @@ class GRPOConfig(TrainConfig):
 
 class DistillationConfig(TrainConfig):
     """
-    On-policy 白盒蒸馏配置：可从 .env、环境变量（DISTILL_*）、配置文件、命令行加载，后者覆盖前者。
+    白盒 logit 蒸馏配置：可从 .env、环境变量（DISTILL_*）、配置文件、命令行加载，后者覆盖前者。
 
     使用方式：用 get_distillation_config() 得到实例，例如：
       cfg = get_distillation_config()
@@ -378,12 +369,14 @@ class DistillationConfig(TrainConfig):
     data_path: str = Field("./dataset/sft_mini_512.jsonl", description="蒸馏训练数据路径（jsonl）")
     data_max_seq_len: int = Field(340, gt=0, description="训练数据截断长度（token）")
 
-    # ----- 模型结构（与 MiniDeepSeekConfig 对齐） -----
-    hidden_size: int = Field(512, gt=0, description="隐藏层维度")
-
     # ----- 恢复与续训 -----
     from_weight: str = Field("pretrain", description="基于哪个权重训练，none 表示从头")
+    teacher_weight: str = Field("full_sft", description="冻结 teacher 模型的权重名称")
     from_resume: bool = Field(False, description="是否自动检测 checkpoint 并续训")
+
+    # ----- 蒸馏损失 -----
+    distill_alpha: float = Field(0.5, ge=0.0, le=1.0, description="soft-target KL loss 的权重")
+    distill_temperature: float = Field(2.0, gt=0.0, description="teacher/student logits 蒸馏温度")
 
     # ----- 实验与工具 -----
     use_swanlab: bool = Field(False, description="是否使用 swanlab 记录")

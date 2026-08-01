@@ -4,7 +4,7 @@
   - PretrainConfig / get_pretrain_config()：预训练配置。
   - SFTConfig / get_sft_config()：Full SFT 配置。
   - DPOConfig / get_dpo_config()：DPO 配置。
-  - DistillationConfig / get_distillation_config()：On-policy 白盒蒸馏配置。
+  - DistillationConfig / get_distillation_config()：白盒 logit 蒸馏配置。
   - GRPOConfig / get_grpo_config()：GRPO 配置。
   - InferConfig / get_infer_config()：推理/对话配置。
 

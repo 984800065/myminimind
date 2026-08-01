@@ -1,5 +1,6 @@
 import os
 import random
+from pathlib import Path
 from typing import Any
 
 import deepspeed
@@ -103,6 +104,52 @@ def get_model_weight_path(
     return path
 
 
+def resolve_model_weight_path(
+    cfg: TrainConfig | InferConfig,
+    *,
+    weight: str | None = None,
+    include_debug: bool | None = None,
+) -> str:
+    """
+    Resolve a raw checkpoint even when caller-side architecture defaults differ.
+
+    The exact structured name remains preferred. If it does not exist, search by
+    the human-selected weight prefix. A unique match is safe because its adjacent
+    config sidecar supplies the actual architecture; multiple matches require the
+    caller to disambiguate explicitly.
+    """
+    exact_path = Path(
+        get_model_weight_path(
+            cfg,
+            weight=weight,
+            include_debug=include_debug,
+        )
+    )
+    if exact_path.exists():
+        return str(exact_path)
+
+    weight_prefix = weight
+    if weight_prefix is None:
+        weight_prefix = cfg.save_weight if isinstance(cfg, TrainConfig) else cfg.weight
+    candidates = sorted(
+        path
+        for path in Path(cfg.save_dir).glob(
+            f"{weight_prefix}_*_moe-*_attn-*.pth"
+        )
+        if not path.name.endswith("_resume.pth")
+    )
+    if len(candidates) == 1:
+        logger.info(f"按权重前缀自动定位 checkpoint: {candidates[0]}")
+        return str(candidates[0])
+    if len(candidates) > 1:
+        candidate_text = "\n".join(f"  - {path}" for path in candidates)
+        raise ValueError(
+            f"权重前缀 {weight_prefix!r} 匹配到多个 checkpoint，请显式指定结构或路径:\n"
+            f"{candidate_text}"
+        )
+    return str(exact_path)
+
+
 def get_resume_weight_path(cfg: TrainConfig, *, weight: str | None = None) -> str:
     """
     Build the resume checkpoint path used by non-DeepSpeed training.
@@ -116,6 +163,47 @@ def get_resume_weight_path(cfg: TrainConfig, *, weight: str | None = None) -> st
         resume_file_name = resume_file_name + "_debug"
     resume_file_name = resume_file_name + "_resume.pth"
     return get_universal_save_path(cfg, resume_file_name)
+
+
+def get_model_config_path(
+    cfg: TrainConfig | InferConfig,
+    *,
+    weight: str | None = None,
+    include_debug: bool | None = None,
+) -> str:
+    """
+    Return the architecture sidecar path associated with a raw weight file.
+
+    A raw PyTorch state dict does not contain model hyperparameters. Keeping a
+    same-stem JSON sidecar prevents inference/export from accidentally rebuilding
+    an MLA checkpoint as GQA, or dropping MoE/MTP layers because infer defaults
+    changed after training.
+    """
+    weight_path = get_model_weight_path(
+        cfg,
+        weight=weight,
+        include_debug=include_debug,
+    )
+    return str(Path(weight_path).with_suffix(".config.json"))
+
+
+def save_model_config(
+    cfg: TrainConfig | InferConfig,
+    lm_config: MiniDeepSeekConfig,
+    *,
+    weight: str | None = None,
+    include_debug: bool | None = None,
+) -> str:
+    """Atomically save the model architecture next to its raw state dict."""
+    config_path = get_model_config_path(
+        cfg,
+        weight=weight,
+        include_debug=include_debug,
+    )
+    tmp_path = config_path + ".tmp"
+    Path(tmp_path).write_text(lm_config.to_json_string(use_diff=False))
+    os.replace(tmp_path, config_path)
+    return config_path
 
 
 def init_distributed(use_deepspeed: bool = False) -> int:
@@ -136,12 +224,29 @@ def init_distributed(use_deepspeed: bool = False) -> int:
     return local_rank
 
 
-def setup_seed(seed: int):
+def setup_seed(seed: int) -> None:
+    """
+    统一设置训练过程中使用的随机数种子，尽量保证实验可复现。
+
+    这里覆盖四类随机数来源：
+    - Python `random`：控制 Python 代码中的随机采样。
+    - NumPy：控制数据预处理等 NumPy 操作的随机行为。
+    - PyTorch CPU：控制 CPU tensor 初始化和随机算子。
+    - PyTorch CUDA：控制当前 GPU 及所有可见 GPU 上的随机算子。
+
+    cuDNN 的 deterministic 模式优先选择确定性算法，关闭 benchmark 则避免
+    cuDNN 根据运行时性能测试动态选择算法。这会提高相同环境下的可复现性，
+    但可能降低训练速度；部分 GPU 算子仍可能存在非确定性实现。
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+    # 同时设置当前 CUDA 设备和所有可见 CUDA 设备，兼容单卡与多卡训练。
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+    # 固定 cuDNN 算法选择，避免相同输入在不同运行中选到不同实现。
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -159,16 +264,26 @@ def _unwrap_stateful_object(value: Any) -> Any:
     return getattr(raw_value, "_orig_mod", raw_value)
 
 
-def _to_cpu_state_dict(value: Any) -> dict[str, Any]:
+def _to_cpu_state_dict(
+    value: Any,
+    *,
+    cast_floating_to_fp16: bool,
+) -> dict[str, Any]:
     """
     Convert a model state dict to CPU tensors so checkpoints are device-agnostic.
 
-    We also cast floating-point tensors to fp16 to keep raw weight files smaller,
-    which matches the project's previous behavior.
+    Raw inference weights may be cast to fp16 for size. Resume checkpoints keep
+    original precision so an interruption does not perturb optimizer training.
     """
     raw_value = _unwrap_stateful_object(value)
     state_dict = raw_value.state_dict()
-    return {key: tensor.half().cpu() for key, tensor in state_dict.items()}
+    cpu_state_dict: dict[str, Any] = {}
+    for key, tensor in state_dict.items():
+        cpu_tensor = tensor.detach().cpu()
+        if cast_floating_to_fp16 and torch.is_floating_point(cpu_tensor):
+            cpu_tensor = cpu_tensor.half()
+        cpu_state_dict[key] = cpu_tensor
+    return cpu_state_dict
 
 
 def _serialize_checkpoint_value(value: Any) -> Any:
@@ -200,10 +315,35 @@ def _get_swanlab_id(swanlab_: Any | None) -> str | None:
     return getattr(swanlab_, "id", None)
 
 
+def _capture_rng_state() -> dict[str, Any]:
+    """Capture RNG streams needed to continue dropout/sampling exactly."""
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(checkpoint_data: dict[str, Any]) -> None:
+    """Restore RNG state from a resume payload when the fields are available."""
+    state = checkpoint_data.get("rng_state")
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
 def lm_checkpoint(
     cfg: TrainConfig,
     model: Any | None = None,
     optimizer: Any | None = None,
+    lm_config: MiniDeepSeekConfig | None = None,
     epoch: int = 0,
     step: int = 0,
     swanlab_: Any | None = None,
@@ -236,15 +376,21 @@ def lm_checkpoint(
             logger.warning(f"GPU数量变化({saved_world_size}→{current_world_size})，step已自动转换为{checkpoint_data['step']}")
         return checkpoint_data
 
-    model_state_dict = _to_cpu_state_dict(model)
-    _atomic_torch_save(model_state_dict, weight_path)
+    raw_model_state_dict = _to_cpu_state_dict(
+        model,
+        cast_floating_to_fp16=True,
+    )
+    _atomic_torch_save(raw_model_state_dict, weight_path)
+    if lm_config is not None:
+        save_model_config(cfg, lm_config)
 
     resume_data: dict[str, Any] = {
-        "model": model_state_dict,
+        "model": _to_cpu_state_dict(model, cast_floating_to_fp16=False),
         "epoch": epoch,
         "step": step,
         "world_size": dist.get_world_size() if dist.is_initialized() else 1,
         "swanlab_id": _get_swanlab_id(swanlab_),
+        "rng_state": _capture_rng_state(),
     }
     if optimizer is not None:
         resume_data["optimizer"] = _serialize_checkpoint_value(optimizer)
@@ -391,7 +537,11 @@ def init_model(
 
     source_weight = cfg.from_weight if from_weight is None else from_weight
     if source_weight != "none":
-        weight_path = get_model_weight_path(cfg, weight=source_weight, include_debug=False)
+        weight_path = resolve_model_weight_path(
+            cfg,
+            weight=source_weight,
+            include_debug=False,
+        )
         weights: dict = torch.load(weight_path, map_location=cfg.device)
 
         ignore_keys = {
@@ -403,7 +553,20 @@ def init_model(
             if k in ignore_keys:
                 weights.pop(k)
 
-        model.load_state_dict(weights, strict=False)
+        incompatible = model.load_state_dict(weights, strict=False)
+        # Fine-tuning may intentionally add heads/layers, but silently ignoring
+        # a large architecture mismatch makes it look as if pretrained weights
+        # were loaded when most of the model is random.
+        if incompatible.missing_keys:
+            logger.warning(
+                f"加载 {weight_path} 时缺少 {len(incompatible.missing_keys)} 个参数键: "
+                f"{incompatible.missing_keys[:8]}"
+            )
+        if incompatible.unexpected_keys:
+            logger.warning(
+                f"加载 {weight_path} 时发现 {len(incompatible.unexpected_keys)} 个多余参数键: "
+                f"{incompatible.unexpected_keys[:8]}"
+            )
 
     get_model_params(model, lm_config)
     logger.info(f"Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M")
