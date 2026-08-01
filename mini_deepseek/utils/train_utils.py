@@ -207,9 +207,29 @@ def save_model_config(
 
 
 def init_distributed(use_deepspeed: bool = False) -> int:
+    """
+    根据启动器注入的环境变量初始化分布式训练，并返回当前进程的本地 GPU 编号。
+
+    `torchrun` 或 DeepSpeed launcher 会为每个训练进程设置以下环境变量：
+    - `RANK`：当前进程在整个分布式任务中的全局编号。
+    - `LOCAL_RANK`：当前进程在本机上的编号，用于选择对应 GPU。
+    - `WORLD_SIZE`：参与训练的总进程数。
+
+    如果不存在 `RANK`，说明当前是普通单进程启动，此时不创建进程组并返回
+    `0`。分布式启动时统一使用 NCCL 后端：DeepSpeed 模式由 DeepSpeed
+    初始化通信环境，原生 DDP 模式则由 PyTorch 从环境变量完成 rendezvous。
+
+    Args:
+        use_deepspeed: 是否由 DeepSpeed 初始化分布式通信环境。
+
+    Returns:
+        当前进程的 `LOCAL_RANK`；非分布式模式返回 `0`。
+    """
+    # 普通 `python -m ...` 启动不会设置 RANK，不需要初始化分布式进程组。
     if int(os.environ.get("RANK", -1)) == -1:
         return 0
 
+    # 两种模式都使用 NCCL 进行 GPU 间通信，但初始化入口由训练引擎决定。
     if use_deepspeed:
         deepspeed.init_distributed(dist_backend="nccl")
     else:
@@ -218,6 +238,7 @@ def init_distributed(use_deepspeed: bool = False) -> int:
             init_method="env://",
         )
 
+    # 每个进程只操作 LOCAL_RANK 对应的 GPU，避免多个进程误用同一设备。
     local_rank = int(os.environ.get("LOCAL_RANK"))
     torch.cuda.set_device(local_rank)
 
